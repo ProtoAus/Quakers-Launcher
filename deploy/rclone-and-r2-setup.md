@@ -281,9 +281,34 @@ After pushing `dist/launcher/`, purge those URLs:
   on every header — `age` was the sole tell, and `age` alone cannot distinguish "stale" from
   "purged, then re-cached seconds ago".
 
-The permanent fix is to give the launcher a versioned filename
-(`quakers-launcher-2026.07.27.exe`) plus a stable redirect, so it becomes immutable like the
-blobs. Until then, purging is a required step of every launcher release.
+### Setting Cache-Control on the object is NOT enough
+
+`r2-push.ps1` uploads the launcher binaries with `Cache-Control: public, max-age=300`, and R2
+stores it — confirmed with `rclone lsjson -M`. Cloudflare then **overrides it on the way out**:
+
+```
+R2 object metadata : cache-control = "public, max-age=300"
+what clients get   : Cache-Control: public, max-age=14400     <- 4 hours
+```
+
+14400 s is Cloudflare's default **Browser Cache TTL**, which replaces the origin's header
+unless the zone is set to *Respect Existing Headers*. So the short TTL that was supposed to make
+launcher pushes self-correct does nothing.
+
+**Fix it once, in the dashboard:** Caching → Configuration → **Browser Cache TTL** →
+**Respect Existing Headers**. This is safe for everything else here: `/objects/` blobs are
+content-addressed and ship `max-age=31536000, immutable`, and manifests ship `max-age=60`.
+Both are more correct than a blanket 4 hours.
+
+Optionally add a Cache Rule for `/launcher/` with a short Edge TTL, so the *edge* copy also
+expires quickly rather than only the browser copy.
+
+Until Browser Cache TTL is changed, **purging after every launcher push is mandatory** — and note
+the stale copy can outlive the origin it came from: after the R2 migration the edge kept serving
+the Pi-era binary (identifiable by its nginx `etag` and `last-modified`) for hours.
+
+The other permanent fix is a versioned filename plus a stable redirect, making the launcher
+immutable like the blobs. The GitHub release assets already are — see §8.
 
 ### How testers get the launcher
 
