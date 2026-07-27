@@ -70,6 +70,10 @@ def hash_file(path):
 SKIP_DIRS = {
     "src", "tools", "_prerender_backup", "screenshots", "dlcache",
     "_staging", ".git", "__pycache__", ".vs", "launcher",
+    # textures/disable/ holds ~455 *_norm.png maps that were switched off by being moved
+    # here: FTE resolves a normal map as textures/<name>_norm, so nothing under a
+    # disable/ subdir is reachable by any material. Shipping them is 141 MB of dead weight.
+    "disable",
 }
 
 # extensions never shipped (source meshes, build cache, dev/debug, editor sources)
