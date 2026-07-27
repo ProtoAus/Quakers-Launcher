@@ -20,7 +20,7 @@ Ships **Windows x64 and Linux x64** from one manifest and one object tree.
   files dedupe across releases and are cached forever; a patch uploads/downloads only what changed.
 - **Manifest** (`manifests/<channel>.json`) lists every file's `path / size / hash`. The launcher diffs
   local files against it: download the missing, re-fetch the corrupt (repair).
-- **One manifest covers every platform.** 5,090 files (6.3 GB) of maps/textures/models/progs are
+- **One manifest covers every platform.** 4,034 files (6.27 GB) of maps/textures/models/progs are
   identical everywhere and carry no `platform` tag; only the engine set differs — 6 files / 11.4 MB
   for `win64`, 5 files / 10.5 MB for `linux64`. The launcher installs `platform == "all"` plus its
   own key, so **adding Linux cost 10.5 MB of storage and zero extra bytes for a Windows tester.**
@@ -34,8 +34,10 @@ Ships **Windows x64 and Linux x64** from one manifest and one object tree.
 
 `publish.py` assembles a clean player install from `C:\FTEQuake` + `C:\FTEQuake\quakers`
 (+ `C:\FTEQuake\_engine\linux64` for the Linux engine set):
-- **Ships (5,101 files / 6.3 GB):** the texture pk3s, loose `textures/` + `models/` + `maps/`,
+- **Ships (4,045 files / 6.28 GB):** the texture pk3s, loose `textures/` + `models/` + `maps/`,
   gfx/sounds/particles/glsl/data, the compiled `.dat`s, cfgs, and both engine binary sets.
+  World textures ship as BC7 `.dds` **inside** the pk3s; a loose `textures/*.png` whose stem is
+  already in a pk3 is dropped automatically, and anything under a `disable/` directory is skipped.
 - **Skipped:** `src/ tools/ _prerender_backup/ _staging/`, source meshes (`.obj/.iqe/.acd/.smd/.mtl/.cmd`),
   the **editor-only** prop PNGs (the game reads the BC7 `.dds` inside the pk3s), logs/dumps/debug
   symbols, `id1/` (commercial). CS/HL/CoD content is never shipped — it's mounted from the tester's own
@@ -47,7 +49,7 @@ Audit any run in `dist/included.txt` and `dist/excluded.txt`.
 
 | Piece | State |
 |---|---|
-| `publish.py` (staging + manifest + object tree + `--prune`) | **Done, verified** — 6.3 GB / 5,101 files across both platforms |
+| `publish.py` (staging + manifest + object tree + `--prune`) | **Done, verified** — 6.28 GB / 4,045 files across both platforms |
 | `quakers/textures/` trim (drop pk3-covered loose textures) | **Done** — dropped 2,861 (~1.9 GB), kept 1,059 not in any pk3 |
 | Rust launcher, Windows (`quakers-launcher.exe`) | **Done, tested** — sync/resume(206)/repair/failover/dry-run all pass |
 | **Rust launcher, Linux** (`quakers-launcher`) | **Done, tested** — 4.1 MB ELF; links only libc/libm/libgcc (rustls+ring, *no* OpenSSL) |
