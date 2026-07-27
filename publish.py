@@ -98,6 +98,10 @@ SKIP_ANY_NAME = {"desktop.ini", "thumbs.db", ".ds_store"}
 SKIP_ROOT_FILES = {
     "csqccore.txt", "ssqccore.txt", "crashaddr.txt",
     "installed.lst", "identity.pfx", "qconsole.log",
+    # Engine-generated gib/impact filter lists. Both are 0 bytes here and nothing in the
+    # mod reads or writes them -- FTE recreates them on demand. Shipping an empty file is
+    # a download, a manifest entry and a disk write to deliver no content.
+    "gibfiltr.cfg", "impfiltr.cfg",
 }
 
 # gamedir-root filename PREFIXES that are dev scratch. conhistory.txt is the engine's
@@ -696,8 +700,21 @@ def main():
     print(f"\nmanifest : {man_path}  ({len(files)} files, {human(total_bytes)})")
     if args.objects:
         print(f"objects  : {objroot}  (+{n_new} new blobs this run, {args.link})")
+
+    # Empty files cost a manifest entry, a request and a disk write to deliver nothing, and
+    # they are almost always engine scratch that got swept up. Not an error -- some formats
+    # do use a zero-length file as a marker -- so this reports rather than drops. Add the
+    # name to SKIP_ROOT_FILES if it turns out to be scratch.
+    empties = [f["path"] for f in files if f["size"] == 0]
+    if empties:
+        print(f"\nNOTE: {len(empties)} zero-byte file(s) in this manifest:")
+        for p in empties[:10]:
+            print(f"        {p}")
+        if len(empties) > 10:
+            print(f"        ... and {len(empties) - 10} more")
+
     print(f"done in {dt:.1f}s\n")
-    print("next: sign the manifest, then rclone sync objects/ + copy manifests/ to R2 and the Pi")
+    print("next: push with  .\\deploy\\r2-push.ps1   (objects first, manifest last)")
     print("      (see C:\\FTEQuake\\launcher\\deploy\\rclone-and-r2-setup.md)")
 
 
