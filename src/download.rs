@@ -2,8 +2,12 @@
 //!
 //! N worker tasks pull files off a shared index. Each file streams to `<dest>.part`
 //! (HTTP Range-resumed if a partial exists), is hashed on the fly, and is atomically
-//! renamed into place only once the hash matches the manifest. On any per-file error
-//! we fail over to the next mirror; the `.part` survives so the retry resumes.
+//! renamed into place only once the hash matches the manifest.
+//!
+//! A failing file is retried with exponential backoff and jitter, cycling mirrors if more
+//! than one is configured. The `.part` survives between attempts, so a retry resumes from
+//! wherever the previous one stopped rather than starting over. Errors that retrying cannot
+//! fix (404/410) short-circuit the budget instead of consuming it.
 
 use crate::hashing::Hasher;
 use crate::manifest::FileEntry;
@@ -145,19 +149,69 @@ async fn download_object(
     if mirrors.is_empty() {
         return Err(last_err);
     }
-    // Cycle mirrors with one extra pass: a hash mismatch clears the .part, so a
-    // single working mirror still gets a clean-slate retry within the same run.
-    let attempts = mirrors.len() + 1;
+
+    // Attempts are decoupled from mirror count. They used to be `mirrors.len() + 1`, which
+    // with a single mirror meant two tries fired back-to-back with no delay -- so one dropped
+    // connection or momentary packet loss consumed the whole budget in milliseconds and the
+    // file was reported failed. That is why a first run could miss a handful of files that a
+    // second run then fetched without trouble.
+    let attempts = MAX_ATTEMPTS.max(mirrors.len() * 2);
     for attempt in 0..attempts {
-        let base = &mirrors[attempt % mirrors.len()];
+        let mirror_no = attempt % mirrors.len();
+        let base = &mirrors[mirror_no];
         let url = format!("{}/{}", base.trim_end_matches('/'), obj_rel);
         match try_one(client, &url, algo, entry, &part, dest, progress, wid, cat).await {
             Ok(()) => return Ok(()),
-            Err(e) => last_err = anyhow!("mirror {}: {}", (attempt % mirrors.len()) + 1, e),
+            Err(e) => {
+                // A 404/410 means the manifest and the mirror disagree about what exists.
+                // No amount of waiting fixes that, and retrying would only delay the report.
+                if e.downcast_ref::<Permanent>().is_some() {
+                    return Err(anyhow!("mirror {}: {}", mirror_no + 1, e));
+                }
+                last_err = anyhow!("mirror {}: {}", mirror_no + 1, e);
+                if attempt + 1 < attempts {
+                    // Show the wait in the UI, so a backing-off worker does not look frozen.
+                    progress.worker_start(
+                        wid,
+                        &format!("{} (retry {}/{})", short_name(&entry.path), attempt + 1, attempts - 1),
+                        entry.size,
+                    );
+                    tokio::time::sleep(backoff(attempt)).await;
+                }
+            }
         }
     }
     Err(last_err)
 }
+
+/// Retry budget per file. Deliberately modest: these delays are paid per *failing* file, so a
+/// mirror that is genuinely down should still surface an error in reasonable time rather than
+/// spending hours backing off across thousands of files.
+const MAX_ATTEMPTS: usize = 5;
+
+/// Exponential backoff, capped at 3s, with jitter so N workers that trip over the same blip do
+/// not resynchronise and hammer the mirror in lockstep. Jitter is derived from the clock rather
+/// than a rand crate — it needs to be uncorrelated, not cryptographic.
+fn backoff(attempt: usize) -> std::time::Duration {
+    let base = std::time::Duration::from_millis(300u64 << attempt.min(4)).min(std::time::Duration::from_secs(3));
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()) % 250)
+        .unwrap_or(0);
+    base + std::time::Duration::from_millis(jitter)
+}
+
+/// An error retrying cannot fix.
+#[derive(Debug)]
+struct Permanent(String);
+
+impl std::fmt::Display for Permanent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for Permanent {}
 
 #[allow(clippy::too_many_arguments)]
 async fn try_one(
@@ -226,6 +280,9 @@ async fn try_one(
         // permanent: every re-run computes the same offset and asks for the same bad range.
         let _ = tokio::fs::remove_file(part).await;
         return Err(anyhow!("HTTP 416 (discarded stale .part; retry starts clean)"));
+    }
+    if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
+        return Err(anyhow!(Permanent(format!("HTTP {status}"))));
     }
     if !status.is_success() {
         return Err(anyhow!("HTTP {}", status));
@@ -365,6 +422,124 @@ mod tests {
         assert_eq!(tokio::fs::read(&dest).await.unwrap(), body);
         assert!(!part.exists(), ".part should be renamed away, not left behind");
         let _ = tokio::fs::remove_file(&dest).await;
+    }
+
+    /// Spins a server that refuses the first `fail_times` connections outright, then serves
+    /// the body. Returns its base URL and a counter of connections it accepted.
+    async fn flaky_server(fail_times: usize, body: Vec<u8>) -> (String, Arc<AtomicUsize>, u16) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let n = hits2.fetch_add(1, Ordering::SeqCst);
+                // Drain the request line/headers so the client sees a clean close, not a reset
+                // mid-write, which is what a real dropped connection looks like.
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                if n < fail_times {
+                    drop(sock); // close with no response -> transient error
+                    continue;
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK
+Content-Length: {}
+Accept-Ranges: bytes
+
+",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (format!("http://{addr}"), hits, addr.port())
+    }
+
+    /// The reported symptom: a first run missed files that a second run fetched fine. With one
+    /// mirror the budget was two immediate attempts, so a single dropped connection failed the
+    /// file outright. Two consecutive drops must now still end in a completed download.
+    #[tokio::test]
+    async fn transient_connection_drops_are_retried() {
+        let body = b"content that survives a flaky connection".to_vec();
+        let (base, hits, port) = flaky_server(2, body.clone()).await;
+        let dir = std::env::temp_dir().join(format!("ql-retry-{}-{}", std::process::id(), port));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let dest = dir.join("flaky.bin");
+
+        let res = download_object(
+            &reqwest::Client::new(),
+            &[base],
+            "blake2b-256",
+            &entry("flaky.bin", &body),
+            &dest,
+            &progress(),
+            0,
+            None,
+        )
+        .await;
+
+        assert!(res.is_ok(), "expected retry to succeed, got {:?}", res.err());
+        assert_eq!(tokio::fs::read(&dest).await.unwrap(), body);
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "2 drops then 1 success");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A 404 means the manifest and the mirror disagree. Retrying cannot fix it, so the budget
+    /// must not be spent on it -- exactly one request.
+    #[tokio::test]
+    async fn missing_objects_fail_fast_without_burning_retries() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                hits2.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 404 Not Found
+Content-Length: 0
+
+")
+                    .await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("ql-404-{}-{}", std::process::id(), addr.port()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let res = download_object(
+            &reqwest::Client::new(),
+            &[format!("http://{addr}")],
+            "blake2b-256",
+            &entry("gone.bin", b"whatever"),
+            &dir.join("gone.bin"),
+            &progress(),
+            0,
+            None,
+        )
+        .await;
+
+        assert!(res.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "404 must not be retried");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn backoff_grows_and_is_capped() {
+        let a = backoff(0).as_millis();
+        let b = backoff(1).as_millis();
+        assert!(a >= 300 && a < 600, "first wait {a}ms");
+        assert!(b >= 600 && b < 1000, "second wait {b}ms");
+        for n in 0..8 {
+            assert!(backoff(n) <= std::time::Duration::from_millis(3250), "capped at attempt {n}");
+        }
     }
 
     /// Full length but wrong bytes has nothing to resume from, so the .part must be

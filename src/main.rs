@@ -128,6 +128,12 @@ async fn run(args: Args) -> Result<()> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("quakers-launcher/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(20))
+        // Per-read inactivity timeout, NOT a whole-request timeout: a 450 MB pk3 on a slow
+        // line may legitimately take many minutes, so a total deadline would kill healthy
+        // downloads. This only fires when the stream stalls outright — without it a hung
+        // connection parks one of the 8 workers indefinitely and the run never finishes.
+        // A stall now surfaces as a retryable error and the file resumes from its .part.
+        .read_timeout(Duration::from_secs(60))
         .build()?;
 
     // ---- fetch manifest (CLI url > mirror bases from CLI/toml > baked-in default) ----

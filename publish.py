@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """
-publish.py -- build a nettest player-install manifest + content-addressed object tree
-for distribution via Cloudflare R2 (primary) + the proto.bar Pi (failover).
+publish.py -- build a quakers player-install manifest + content-addressed object tree
+for distribution via Cloudflare R2 (bucket `quakers-dl`, served at dl.proto.bar).
 
-It walks the engine install root and the nettest gamedir, applies the ship/skip rules,
+It walks the engine install root and the quakers gamedir, applies the ship/skip rules,
 hashes every shippable file, and writes:
 
     <out>/manifests/<channel>.json      the manifest (path / size / hash / component)
     <out>/objects/<hh>/<hash>           content-addressed blobs (hardlinked from source)
     <out>/included.txt, excluded.txt    audit lists
 
-Nothing is uploaded here. Once the mirrors exist, publish with rclone (see deploy/):
-    rclone sync <out>/objects   r2:nettest-dl/objects   --checksum --transfers=16
-    rclone sync <out>/objects   pi:/srv/nettest/objects --checksum
-    rclone copy <out>/manifests r2:nettest-dl/manifests            # publish LAST (atomic)
-    rclone copy <out>/manifests pi:/srv/nettest/manifests
+Nothing is uploaded here. Push with:
+    .\deploy\r2-push.ps1
+
+which sends objects first and the manifest LAST -- the manifest is the atomic switch that
+makes a release live, so publishing it before its blobs exist hands testers a manifest that
+references objects nobody can download. The script also sets the per-prefix Cache-Control and
+forces IPv4; see deploy/rclone-and-r2-setup.md for why both matter.
+
+The proto.bar Pi is no longer a mirror. It was one until 2026-07-27, when a single tester's
+install saturated the home uplink: Cloudflare's cache is per-edge-server and the launcher runs
+8 parallel workers, so the origin served 6.20 GB to deliver a 5.84 GB payload.
 
 The manifest records `hash_algo` so the Rust launcher uses the matching hash. BLAKE3 is
 preferred (much faster on 8 GB, multithreaded); if the `blake3` module isn't installed we
@@ -432,7 +438,7 @@ def main():
     ap.add_argument("--version", default=None, help="build id (default: UTC timestamp)")
     # Keep in step with `version` in Cargo.toml -- this is what a future self-update check
     # would compare against, so a stale value here would tell every client it is current.
-    ap.add_argument("--launcher-version", default="0.1.2")
+    ap.add_argument("--launcher-version", default="0.1.3")
     ap.add_argument("--mirrors", nargs="*", default=["https://dl.proto.bar"])
     ap.add_argument("--objects", dest="objects", action="store_true", default=True,
                     help="build the content-addressed objects/ tree (default)")
