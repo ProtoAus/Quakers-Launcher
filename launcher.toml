@@ -1,0 +1,37 @@
+# quakers launcher config — ship this next to the launcher binary.
+# On launch the launcher reads the manifest from the first reachable mirror, then downloads
+# any missing/changed objects by hash (resumable, parallel), verifying each before use.
+# It installs the files tagged for its own platform plus the shared "all" content, and sets
+# the executable bit on the engine binaries it writes.
+#
+# Only `mirrors` is read today; the others are documented for the signing/self-update work (M3)
+# and are ignored for now. CLI flags (--mirror, --channel, --concurrency, --install-dir) override.
+
+channel     = "beta"
+install_dir = "."          # "." = alongside the launcher binary; the whole game lives here
+concurrency = 8            # parallel download workers (the per-thread rows in the progress UI)
+
+# Tried in order, per file, with automatic failover on error.
+#
+#   dl.proto.bar     Cloudflare R2 — PRIMARY. $0 egress at any volume, global edge, and it keeps
+#                    the launch spike off the Pi's 40 Mbps uplink (which also carries the live
+#                    game server). NOT LIVE YET: proto.bar still delegates to Namecheap, so the
+#                    Cloudflare zone is Pending and no R2 custom domain can be attached.
+#                    See deploy/rclone-and-r2-setup.md §0.
+#   files.proto.bar  The Pi, nginx off the NVMe — FAILOVER. Grey-clouded (DNS only) on purpose:
+#                    Cloudflare's CDN terms cover bulk non-Cloudflare-hosted files at their
+#                    discretion, and R2 is the sanctioned path for that traffic.
+#
+# UNTIL THE NAMESERVERS ARE SWITCHED, dl.proto.bar is still the Pi's own A record and works as-is —
+# so this list is correct today and stays correct after the cutover; only the box answering
+# dl.proto.bar changes.
+mirrors = [
+    "https://dl.proto.bar",       # R2 primary (today: still the Pi, pre-cutover)
+    "https://files.proto.bar",    # Pi failover (add the DNS record when you free up dl.)
+]
+
+# --- M3 (not yet wired) ---
+# Manifest signature check (ed25519). While false, the launcher still verifies every file's
+# content hash from the manifest fetched over HTTPS.
+verify_signature = false
+# pubkey = "PUT-ED25519-PUBKEY-HERE"

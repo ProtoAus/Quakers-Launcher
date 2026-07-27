@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target/
+
+# Release output. dist/ holds the content-addressed object tree (~6.3 GB of game
+# data, hardlinked from the install) plus the generated manifest and the staged
+# launcher binaries. All of it is reproducible from `publish.py` + `build-linux.sh`,
+# and none of it belongs in git.
+/dist/
+/_old_manifests/
+
+__pycache__/
+*.pyc
+
+# Local audit output
+included.txt
+excluded.txt
+.hashcache.json
+
+# Secrets — rclone remotes hold the R2 access key/secret. Never commit them.
+rclone.conf
+*.pfx
+*.pem
+*.key
+
+# OS droppings
+desktop.ini
+Thumbs.db
+.DS_Store

@@ -1,0 +1,45 @@
+[package]
+name = "quakers-launcher"
+version = "0.1.0"
+edition = "2021"
+description = "Minecraft-style launcher for the Quakers FTE game: resumable content-addressed download, verify/repair, launch."
+license = "MIT"
+
+[[bin]]
+name = "quakers-launcher"
+path = "src/main.rs"
+
+[lib]
+name = "quakers_launcher"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync"] }
+# rustls + ring + bundled webpki roots. Deliberately NOT the default native-tls: that means
+# schannel on Windows but OpenSSL on Linux, which would (a) need libssl-dev to build and
+# (b) tie the shipped binary to the tester's system libssl.so.3 — the exact thing that makes
+# a Linux game binary fail to start on a different distro. `rustls-tls` (not the aws-lc
+# variants) resolves to the pure-Rust `ring` backend, so there is still no cmake/nasm/C
+# toolchain requirement on either host.
+reqwest = { version = "0.12", default-features = false, features = [
+    "stream", "http2", "charset", "rustls-tls",
+] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# pure-Rust hashers -> no C compiler / nasm needed at build time
+blake3 = { version = "1", features = ["pure"] }
+blake2 = "0.10"
+digest = "0.10"
+hex = "0.4"
+ratatui = "0.29"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"

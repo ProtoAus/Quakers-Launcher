@@ -1,0 +1,38 @@
+# Caddyfile for the proto.bar Pi -- the FAILOVER download mirror.
+# ALTERNATIVE to nginx-quakers-dl.conf; use one or the other, not both.
+# Cloudflare R2 is the primary; this only serves when R2 is unreachable, so keep it lean.
+# Install Caddy on the NanoPi (ARM64):  https://caddyserver.com/docs/install  (or `apt install caddy`)
+# Put this file at /etc/caddy/Caddyfile, then:  sudo systemctl reload caddy
+#
+# Serves the SAME layout publish.py + rclone push here:
+#   /srv/nvme/quakers/dl/objects/<hh>/<hash>     content-addressed blobs (immutable)
+#   /srv/nvme/quakers/dl/manifests/<channel>.json
+#
+# IMPORTANT: this box also runs the live game server on the same 40 Mbps uplink. Cap this
+# mirror's bandwidth at the OS/router level so a download surge can't starve the game -- see
+# rclone-and-r2-setup.md ("Keep downloads off the game server"). Caddy core has no bandwidth
+# limiter; do it with tc/wondershaper or router QoS.
+
+files.proto.bar {
+	root * /srv/nvme/quakers/dl
+	file_server
+
+	# content-addressed blobs never change -> cache forever
+	@objects path /objects/*
+	header @objects Cache-Control "public, max-age=31536000, immutable"
+
+	# manifests change every publish -> revalidate quickly
+	@manifests path /manifests/*
+	header @manifests Cache-Control "public, max-age=30, must-revalidate"
+
+	# let the launcher (and a browser health check) read cross-origin
+	header Access-Control-Allow-Origin "*"
+
+	# blobs are pre-compressed (pk3/dds/png/ogg); only gzip the tiny JSON manifests
+	encode gzip
+
+	log {
+		output file /var/log/caddy/quakers.log
+		format console
+	}
+}
