@@ -70,18 +70,51 @@ harmless console line `Plugin ode does not appear to be loaded` at server start 
 
 ## ⚠ glibc floor: 2.34
 
-Built on Ubuntu 22.04, the binaries require **GLIBC_2.34**:
+Built on Ubuntu 22.04, the binaries require **GLIBC_2.34**. glibc is backward-compatible but not
+forward-compatible, so anything older simply refuses to start.
 
-| Distro | glibc | Works? |
+Check the build's requirement with
+`objdump -T <binary> | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1`,
+and a tester's machine with `ldd --version`.
+
+### Supported
+
+| Distro | glibc |
+|---|---|
+| Ubuntu 22.04 LTS / 24.04 LTS / 25.04 | 2.35 / 2.39 / 2.41 |
+| Debian 12 *bookworm* / 13 *trixie* | 2.36 / 2.41 |
+| Linux Mint 21.x / 22.x | 2.35 / 2.39 (Ubuntu base) |
+| Pop!_OS 22.04 | 2.35 |
+| Zorin OS 17, elementary OS 7 | 2.35 (Ubuntu 22.04 base) |
+| Fedora 40 / 41 / 42 | 2.39 / 2.40 / 2.41 |
+| RHEL / Rocky / Alma 9 | 2.34 — exactly at the floor, works |
+| RHEL / Rocky / Alma 10 | 2.39 |
+| openSUSE Leap 15.6 | 2.38 |
+| openSUSE Tumbleweed | rolling |
+| Arch, Manjaro, EndeavourOS, CachyOS, Garuda | rolling (2.4x) |
+| **SteamOS 3.5+ (Steam Deck)** | 2.37+ (Arch base) |
+| Bazzite, Nobara, ChimeraOS | Fedora/Arch base, current |
+| Gentoo, NixOS, Void (glibc flavour) | current |
+| Kali, MX Linux 23 | Debian 12/testing base |
+
+### Not supported
+
+| Distro | glibc | |
 |---|---|---|
-| Ubuntu 22.04 / 24.04 | 2.35 / 2.39 | yes |
-| Debian 12 | 2.36 | yes |
-| Fedora 35+, Arch, SteamOS 3 | 2.34+ | yes |
-| **Ubuntu 20.04** | 2.31 | **no** |
-| **Debian 11** | 2.31 | **no** |
-| **RHEL / Rocky 8** | 2.28 | **no** |
+| Ubuntu 20.04 LTS | 2.31 | EOL for standard support since Apr 2025 |
+| Debian 11 *bullseye* | 2.31 | |
+| RHEL / Rocky / Alma 8 | 2.28 | |
+| openSUSE Leap 15.5 | 2.31 | |
+| Linux Mint 20.x | 2.31 | Ubuntu 20.04 base |
+| **Alpine, Void (musl), Chimera Linux** | **n/a — musl** | Not a glibc version problem: musl is a different libc entirely, so **no** glibc build will ever run. Would need a separate musl target. |
 
-Check with `objdump -T <binary> | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1`.
+Derived distros inherit their base's glibc — Mint/Pop!\_OS/Zorin/elementary follow Ubuntu, MX/Kali
+follow Debian, Bazzite/Nobara follow Fedora, SteamOS/Manjaro/CachyOS follow Arch. When in doubt,
+`ldd --version` settles it in one second.
+
+To drop the floor to 2.31 (adds Ubuntu 20.04, Debian 11, Mint 20, Leap 15.5), build in an Ubuntu
+20.04 container or WSL distro — the build scripts are unchanged, only the host moves. Nothing else
+about the pipeline cares.
 
 If testers on older LTS releases matter, build in an Ubuntu 20.04 container (or add a 20.04 WSL
 distro) to drop the floor to 2.31. For a 2026 alpha aimed at current desktops and the Steam Deck,
