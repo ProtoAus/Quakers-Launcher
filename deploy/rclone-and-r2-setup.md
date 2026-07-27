@@ -4,36 +4,40 @@ One-time setup. After this, every release is `python publish.py --prune` then tw
 
 ---
 
-## 0. STOP — proto.bar is not on Cloudflare yet
+## 0. Status — the zone is Active; R2 is the remaining piece
 
-**Every record you added in the Cloudflare dashboard is currently inert.** `proto.bar` still
-delegates to Namecheap, so the Cloudflare zone is stuck in *Pending Nameserver Update*: Cloudflare
-is not authoritative, nothing is proxied, and **an R2 custom domain cannot be attached to a pending
-zone.** Verified live:
+The nameserver cutover completed **2026-07-27**. `dl.proto.bar` is proxied and Cloudflare is
+authoritative, so an R2 custom domain *can* now be attached.
+
+### Why R2 stopped being optional
+
+On the evening of 2026-07-27 a single tester's ~6 GB install took the house connection down.
+The instinct was that the launcher had bypassed the CDN. It had not — every origin request in
+`/var/log/nginx/access.log` came from a Cloudflare edge IP (`172.68.x`), UA
+`quakers-launcher/0.1.0`. Measured over that one session:
 
 ```
-$ nslookup -type=NS proto.bar 8.8.8.8
-proto.bar   nameserver = dns1.registrar-servers.com
-proto.bar   nameserver = dns2.registrar-servers.com     <- Namecheap, not Cloudflare
-
-$ curl -sI https://dl.proto.bar/manifests/alpha.json
-HTTP/1.1 200 OK
-Server: nginx/1.22.1          <- the Pi answering directly; no `cf-ray`, so NOT proxied
+requests to origin        9,801
+unique objects among them 3,316
+re-fetch ratio            2.96x        <- Cloudflare pulled each object ~3 times
+bytes off the Pi          6.20 GB      <- for a 5.84 GB payload
+peak                      ~14.5 MB/s
 ```
 
-### Fix it first
-1. Cloudflare dashboard → `proto.bar` → **Overview** → copy the two assigned nameservers
-   (they look like `xxx.ns.cloudflare.com`).
-2. Namecheap → Domain List → `proto.bar` → **Manage** → *Nameservers* → switch
-   **Namecheap BasicDNS → Custom DNS** → paste both Cloudflare nameservers → save (the green tick).
-3. Wait for the zone to flip to **Active** (usually minutes, up to 24 h). Cloudflare emails you.
+**Cloudflare's cache is per-edge-server, not per-account.** The launcher opens 8 parallel
+workers; those land on different machines within the same PoP, each with its own cache, each
+missing independently, each fetching from origin. Caching in front of a home connection does not
+remove the home connection from the path — it only reduces how often it is used, and with
+parallel cold fetches it can *amplify* instead. Two mitigations, in order of effect:
 
-**Before you flip, confirm the MX + SPF records are in the Cloudflare zone**, or email forwarding
-for `@proto.bar` breaks the moment the nameservers change. You already have all five
-`eforward1-5.registrar-servers.com` MX records and the SPF TXT — just verify they are still there
-and **DNS only** (grey cloud). Mail can never be proxied.
+1. **R2** (this document). The origin is Cloudflare's own storage, so there is no home uplink to
+   saturate at all. This is the fix.
+2. **Tiered Cache** (Caching → Tiered Cache → Smart Tiered Cache, free). Funnels edge misses
+   through one upper-tier PoP so origin sees each object once rather than once per edge server.
+   Worth enabling regardless — it also cuts R2 Class B ops.
 
-Nothing below works until the zone says Active.
+Note also `limit_rate` in the Pi vhost was commented out and labelled *"Optional"*. It was not
+optional; nothing capped egress. It is now uncommented with `limit_conn` alongside it.
 
 ---
 
@@ -43,11 +47,23 @@ Three jobs, three names. This is the split the configs in this directory assume:
 
 | Hostname | Points at | Proxy | Why |
 |---|---|---|---|
-| `dl.proto.bar` | **Cloudflare R2** | Orange (R2 manages it) | Primary. $0 egress, global edge, absorbs the launch spike. |
-| `files.proto.bar` | The Pi (`180.150.62.57`) | **Grey (DNS only)** | Failover. See the ToS note in §6. |
+| `dl.proto.bar` | **Cloudflare R2** | Orange (R2 manages it) | Everything the launcher fetches. $0 egress, no home uplink in the path. |
 | `play.proto.bar` | The Pi (`180.150.62.57`) | **Grey (DNS only)** | The game server. **Must** be grey — see §5. |
 
-You already have `dl.proto.bar` as a **grey A record to the Pi**. To hand that name to R2:
+**Keep `dl.proto.bar` as the name and give it to R2.** That is deliberate: `launcher.toml` in the
+already-shipped v0.1.1 build has `https://dl.proto.bar` baked in, so moving the *hostname* rather
+than changing the *URL* means every launcher already in someone's hands switches to R2 with no
+re-release and no action from the tester. Putting R2 on a new name (`cdn.proto.bar`) would strand
+every copy already downloaded.
+
+Serve the launcher binaries from R2 too (`/launcher/*`), not just `/objects/` — otherwise the Pi
+stays in the path for the one file every tester fetches first.
+
+There is no Pi mirror in this table on purpose. A second mirror is worth adding when a second
+*host* exists; a fallback that points back at the home connection re-creates the exact failure
+this migration is fixing, just less often.
+
+`dl.proto.bar` is currently a **proxied A record to the Pi**. To hand that name to R2:
 
 - **Delete the `dl.proto.bar` A record first.** Attaching an R2 custom domain to a hostname that
   already has an A/CNAME fails with API error **10056 — "DNS record for this domain already exists
@@ -173,16 +189,15 @@ Class B ops. **Egress is $0 at any volume** — that is the entire reason for R2
 custom domains too (Cloudflare's CDN bandwidth is unmetered on every plan).
 Rates past the free tier: $0.015/GB-month, $4.50/M Class A, $0.36/M Class B.
 
-**512 MB edge-cache ceiling (Free/Pro/Business).** Two objects exceed it:
+**512 MB edge-cache ceiling (Free/Pro/Business).** **No object exceeds it any more.** The two
+that did — `polyhaven_props.pk3` (2.12 GB) and `polyhaven.pk3` (781 MB) — were split with
+`quakers/tools/split_pk3.py`; the largest object is now 451.8 MB. Verified against the live
+`alpha` manifest: 0 entries over 536,870,912 bytes.
 
-| File | Size | Effect |
-|---|---|---|
-| `quakers/polyhaven_props.pk3` | 2.12 GB | Served normally, **never edge-cached** |
-| `quakers/polyhaven.pk3` | 781 MB | Served normally, **never edge-cached** |
-
-They still download fine and still cost $0 in egress — they just come from R2 on every request
-instead of the edge, so they are slower and burn a Class B op each time. Nothing to fix for the
-alpha. If it ever matters, split them into <512 MB pk3s at pack time.
+Keep it that way. An oversized pack is not an error and produces no warning — it simply never
+caches, so it comes off origin on **every single request** while everything around it caches
+normally. `split_pk3.py` bin-packs on compressed size under a 450 MiB cap and warns if any part
+lands over 512 MB; run it whenever a pack grows.
 
 **Timeouts.** The proxy's default **Proxy Read Timeout is 125 s** (the widely repeated "100 s" is
 stale) and it governs how long the *origin* may take to start responding — it does not kill an
