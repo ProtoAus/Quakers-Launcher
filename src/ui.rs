@@ -75,12 +75,19 @@ pub fn category_of(path: &str) -> &'static str {
         return "Engine";
     };
     match rest.split_once('/') {
-        Some((top, _)) => match top {
+        Some((top, tail)) => match top {
             "models" => "Models",
             "maps" => "Maps",
             "sounds" => "Sounds",
             "textures" => "Textures",
-            "gfx" | "sprites" => "Interface",
+            // gfx/ is mostly HUD and menu art, but gfx/decals (bullet holes, sprays) and
+            // gfx/env (skyboxes) are world textures by any sane reading — bucket them with
+            // the textures so the breakdown reflects what's actually being fetched.
+            "gfx" => match tail.split('/').next().unwrap_or("") {
+                "decals" | "env" => "Textures",
+                _ => "Interface",
+            },
+            "sprites" => "Interface",
             _ => "Game data",
         },
         // gamedir-root files: the big pk3 packs dominate the payload, so they get
@@ -578,6 +585,10 @@ mod tests {
         assert_eq!(category_of("quakers/textures/wall.dds"), "Textures");
         assert_eq!(category_of("quakers/gfx/conback.lmp"), "Interface");
         assert_eq!(category_of("quakers/sprites/flame.spr"), "Interface");
+        // decals and skyboxes are world textures, not HUD art
+        assert_eq!(category_of("quakers/gfx/decals/impacts/hole1.png"), "Textures");
+        assert_eq!(category_of("quakers/gfx/env/sky_01_up.png"), "Textures");
+        assert_eq!(category_of("quakers/gfx/rain/streak2.png"), "Interface");
         assert_eq!(category_of("quakers/glsl/water.glsl"), "Game data");
         assert_eq!(category_of("quakers/default.cfg"), "Game data");
     }

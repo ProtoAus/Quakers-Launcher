@@ -94,6 +94,11 @@ SKIP_ROOT_FILES = {
     "installed.lst", "identity.pfx", "qconsole.log",
 }
 
+# gamedir-root filename PREFIXES that are dev scratch. conhistory.txt is the engine's
+# console-input history and Windows makes copies of it ("conhistory (2).txt"), so an
+# exact-name list never keeps up.
+SKIP_ROOT_PREFIXES = ("conhistory", "qconsole")
+
 # Engine binaries (component = "engine"). Entries are (filename, source-subdir-of-install-root,
 # needs-exec-bit). The ~6.3 GB of game content is identical on every platform and is tagged
 # platform "all"; only this ~15 MB set differs, and the content-addressed object tree means the
@@ -267,6 +272,8 @@ def skip_reason(rel, name, ext, pk3_tex=frozenset(), used_tex=None):
     if ext in SKIP_EXT:
         return "ext"
     if "/" not in relslash and low in SKIP_ROOT_FILES:
+        return "root-junk"
+    if "/" not in relslash and low.startswith(SKIP_ROOT_PREFIXES):
         return "root-junk"
     # editor-only prop PNGs (game reads the BC7 .dds inside the pk3s); world textures under
     # textures/ and HUD art under gfx/ are kept.
