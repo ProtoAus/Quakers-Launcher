@@ -93,7 +93,11 @@ Linux (same flags):
 ```
 chmod +x quakers-launcher && ./quakers-launcher
 ```
-Drop the launcher + `launcher.toml` in an empty folder and run — it prints where it is about to
+**One file is all a tester needs.** Drop `quakers-launcher.exe` in an empty folder and run it —
+every setting has a compiled-in default, so there is no companion file to lose. `launcher.toml`
+is an optional override (see below), not something to hand out.
+
+It prints where it is about to
 install, how many files and how many bytes, and waits for you to confirm before writing anything.
 Enter accepts (`Download to <dir>?`, or `Continue download?` if a partial install is already
 there); Esc/n/q backs out. With no interactive terminal — piped, redirected, CI — it proceeds
@@ -110,6 +114,23 @@ sudo apt install libgl1 libx11-6 libxrandr2 libxcursor1 libxxf86vm1 libasound2 \
                  libfreetype6 libpng16-16 libjpeg-turbo8 zlib1g
 ```
 Most desktop installs already have all of these.
+
+### `launcher.toml` (optional)
+
+Never required. Place it next to the exe (or in the install dir) to override the compiled-in
+defaults — useful for pointing one tester at a test mirror without building them a binary:
+
+```toml
+mirrors     = ["https://dl.proto.bar"]   # tried before the manifest's own list
+channel     = "alpha"                    # picks manifests/<channel>.json
+install_dir = "."                        # only honoured from the file beside the exe
+concurrency = 8                          # parallel download workers
+```
+
+Precedence is **CLI flag > launcher.toml > compiled-in default > manifest**, per setting. A
+missing or malformed file is silently ignored rather than an error — that is what makes the
+single-file distribution work. `install_dir` is read only from the exe-adjacent copy, since it
+decides where the *other* candidate file would be.
 
 ## Usage (dev machine)
 

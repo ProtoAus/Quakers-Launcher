@@ -1,11 +1,18 @@
-# quakers launcher config — ship this next to the launcher binary.
+# quakers launcher config — ENTIRELY OPTIONAL.
+#
+# The launcher ships as a SINGLE FILE: every value here has a compiled-in default, so a bare
+# quakers-launcher.exe dropped into an empty folder installs and launches the game with no
+# companion file. Do not hand this to testers. It exists to point a tester at a test mirror,
+# or pin a channel, without building them a new binary.
+#
+# Precedence, highest first:  CLI flag  >  this file  >  compiled-in default  >  manifest.
+# Looked for next to the exe first, then in the install dir. A missing or malformed file is
+# silently ignored, never an error.
+#
 # On launch the launcher reads the manifest from the first reachable mirror, then downloads
 # any missing/changed objects by hash (resumable, parallel), verifying each before use.
 # It installs the files tagged for its own platform plus the shared "all" content, and sets
 # the executable bit on the engine binaries it writes.
-#
-# Only `mirrors` is read today; the others are documented for the signing/self-update work (M3)
-# and are ignored for now. CLI flags (--mirror, --channel, --concurrency, --install-dir) override.
 
 channel     = "alpha"
 install_dir = "."          # "." = alongside the launcher binary; the whole game lives here

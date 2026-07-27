@@ -10,8 +10,16 @@ use ratatui::crossterm::style::Stylize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+// The launcher ships as ONE file. Everything below is a compiled-in default so that a bare
+// quakers-launcher.exe, dropped into an empty folder, installs and launches the game with no
+// companion launcher.toml. That file remains supported as an optional override -- see config.rs
+// for the precedence rule (CLI > launcher.toml > these).
 /// Baked-in fallback so a lone launcher.exe works with no launcher.toml / CLI args.
 const DEFAULT_MIRRORS: &[&str] = &["https://dl.proto.bar"];
+/// Player-facing: printed verbatim in the header as "Release <channel> · <version>".
+/// Keep in step with publish.py's --channel default.
+const DEFAULT_CHANNEL: &str = "alpha";
+const DEFAULT_CONCURRENCY: usize = 8;
 
 #[derive(Parser, Debug)]
 #[command(name = "quakers-launcher", version, about = "Download, verify, and launch the Quakers game")]
@@ -20,10 +28,11 @@ struct Args {
     #[arg(long)]
     install_dir: Option<PathBuf>,
 
-    /// Release channel. Shown verbatim in the launcher header, so it is player-facing:
-    /// "alpha" for the Alpha release. Keep in step with publish.py's --channel default.
-    #[arg(long, default_value = "alpha")]
-    channel: String,
+    /// Release channel [default: alpha]. Shown verbatim in the launcher header, so it is
+    /// player-facing. Option, not a clap default, so launcher.toml can sit between the flag
+    /// and the compiled-in DEFAULT_CHANNEL.
+    #[arg(long)]
+    channel: Option<String>,
 
     /// Override mirror base URL(s); repeatable. Falls back to launcher.toml, then the manifest.
     #[arg(long = "mirror")]
@@ -33,9 +42,9 @@ struct Args {
     #[arg(long)]
     manifest_url: Option<String>,
 
-    /// Parallel download workers.
-    #[arg(long, default_value_t = 8)]
-    concurrency: usize,
+    /// Parallel download workers [default: 8].
+    #[arg(long)]
+    concurrency: Option<usize>,
 
     /// Hash every file (full integrity check) and repair any mismatch.
     #[arg(long)]
@@ -97,7 +106,13 @@ fn pause_on_exit() {
 
 async fn run(args: Args) -> Result<()> {
     print_banner();
-    let requested = args.install_dir.clone().unwrap_or_else(default_install_dir);
+    // install_dir has to be resolved before the main config load, because it decides where the
+    // second candidate launcher.toml lives -- so only the exe-adjacent file can set it.
+    let requested = args
+        .install_dir
+        .clone()
+        .or_else(|| config::install_dir_override().map(PathBuf::from))
+        .unwrap_or_else(default_install_dir);
     let (install_dir, redirected) = resolve_install_dir(requested, args.allow_unsafe_dir);
     if let Some(why) = &redirected {
         println!();
@@ -125,6 +140,18 @@ async fn run(args: Args) -> Result<()> {
     }
 
     let cfg = config::load(&install_dir);
+    // CLI > launcher.toml > compiled-in default, for each setting independently.
+    let channel = args
+        .channel
+        .clone()
+        .or_else(|| cfg.channel.clone())
+        .unwrap_or_else(|| DEFAULT_CHANNEL.to_string());
+    let concurrency = args
+        .concurrency
+        .or(cfg.concurrency)
+        .unwrap_or(DEFAULT_CONCURRENCY)
+        .max(1);
+
     let client = reqwest::Client::builder()
         .user_agent(concat!("quakers-launcher/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(20))
@@ -154,7 +181,7 @@ async fn run(args: Args) -> Result<()> {
         let mut found = None;
         let mut errs = Vec::new();
         for b in &bases {
-            let u = format!("{}/manifests/{}.json", b.trim_end_matches('/'), args.channel);
+            let u = format!("{}/manifests/{}.json", b.trim_end_matches('/'), channel);
             match manifest::fetch_manifest(&client, &u).await {
                 Ok(m) => {
                     source = u;
@@ -253,7 +280,7 @@ async fn run(args: Args) -> Result<()> {
             install_dir.clone(),
             the_plan.to_download.clone(),
             the_plan.bytes_to_download,
-            args.concurrency,
+            concurrency,
             ui::Header {
                 system: ui::system_description(),
                 platform: manifest::platform_key().to_string(),
