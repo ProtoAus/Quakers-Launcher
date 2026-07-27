@@ -291,17 +291,32 @@ R2 object metadata : cache-control = "public, max-age=300"
 what clients get   : Cache-Control: public, max-age=14400     <- 4 hours
 ```
 
-14400 s is Cloudflare's default **Browser Cache TTL**, which replaces the origin's header
-unless the zone is set to *Respect Existing Headers*. So the short TTL that was supposed to make
-launcher pushes self-correct does nothing.
+It is **not** a global override, which is what makes it confusing to chase. Compare the four
+paths — same bucket, same push command, same stored metadata:
 
-**Fix it once, in the dashboard:** Caching → Configuration → **Browser Cache TTL** →
-**Respect Existing Headers**. This is safe for everything else here: `/objects/` blobs are
-content-addressed and ship `max-age=31536000, immutable`, and manifests ship `max-age=60`.
-Both are more correct than a blanket 4 hours.
+| Path | R2 stores | Client receives | |
+|---|---|---|---|
+| `/objects/<hh>/<hash>` | `max-age=31536000` | `max-age=31536000, immutable` | untouched |
+| `/manifests/alpha.json` | `max-age=60` | `max-age=60` | untouched |
+| `/launcher/quakers-launcher` | `max-age=300` | `max-age=300` | untouched |
+| `/launcher/quakers-launcher**.exe**` | `max-age=300` | **`max-age=14400`** | **rewritten** |
 
-Optionally add a Cache Rule for `/launcher/` with a short Edge TTL, so the *edge* copy also
-expires quickly rather than only the browser copy.
+The only variable is the file extension. `.exe` is on Cloudflare's **default cached-extension
+list**, and files matching it get the zone default TTL (4 h) applied over the origin's header.
+The Linux binary beside it — identical upload, no extension — keeps its 300 s. So there is no
+global setting misconfigured, and looking for one is a dead end.
+
+**Fix:** add a Cache Rule for `/launcher/`, exactly like the `/objects/` one, which takes the
+path out of default extension handling:
+
+- **Rules → Cache Rules → Create rule**, name it `launcher short TTL`
+- When: *Hostname equals* `dl.proto.bar` *and* *URI Path starts with* `/launcher/`
+- Then: **Eligible for cache**; **Browser TTL → Respect origin TTL**; Edge TTL → *Use
+  cache-control header if present*
+
+Zone-wide **Caching → Configuration → Browser Cache TTL → Respect Existing Headers** also works,
+but the setting is not present on every dashboard and Cloudflare has been folding it into Cache
+Rules. The rule is the reliable route and is scoped to the one path that needs it.
 
 Until Browser Cache TTL is changed, **purging after every launcher push is mandatory** — and note
 the stale copy can outlive the origin it came from: after the R2 migration the edge kept serving
