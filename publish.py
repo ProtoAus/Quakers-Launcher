@@ -432,7 +432,7 @@ def main():
     ap.add_argument("--version", default=None, help="build id (default: UTC timestamp)")
     # Keep in step with `version` in Cargo.toml -- this is what a future self-update check
     # would compare against, so a stale value here would tell every client it is current.
-    ap.add_argument("--launcher-version", default="0.1.1")
+    ap.add_argument("--launcher-version", default="0.1.2")
     ap.add_argument("--mirrors", nargs="*", default=["https://dl.proto.bar"])
     ap.add_argument("--objects", dest="objects", action="store_true", default=True,
                     help="build the content-addressed objects/ tree (default)")

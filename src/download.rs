@@ -195,12 +195,38 @@ async fn try_one(
     }
     progress.worker_set_cur(wid, offset);
 
+    // A .part holding every byte is not a resume -- it is a finished download that was
+    // interrupted between the last write and the rename below. Do NOT range-request from
+    // here: `Range: bytes=<size>-` starts at EOF, which RFC 7233 defines as unsatisfiable,
+    // so the server answers 416 and the old code reported a hard failure that re-running
+    // could never clear (the .part never shrank, so every retry asked for the same range).
+    // The bytes are already local, so this needs no request at all.
+    if offset == entry.size {
+        let got = hasher.hex();
+        if got == entry.hash {
+            return finalize(entry, part, dest).await;
+        }
+        // Full length but wrong content: nothing to resume from. Discard and refetch clean.
+        let _ = tokio::fs::remove_file(part).await;
+        offset = 0;
+        hasher = Hasher::new(algo)?;
+        progress.worker_set_cur(wid, 0);
+    }
+
     let mut req = client.get(url);
     if offset > 0 {
         req = req.header(RANGE, format!("bytes={}-", offset));
     }
     let resp = req.send().await?;
     let status = resp.status();
+    if status == StatusCode::RANGE_NOT_SATISFIABLE {
+        // The server says our resume point is past the end of the object. Whatever the cause
+        // -- a .part from an older build, an object replaced under the same name -- there is
+        // nothing here to resume from, and leaving the .part in place makes the failure
+        // permanent: every re-run computes the same offset and asks for the same bad range.
+        let _ = tokio::fs::remove_file(part).await;
+        return Err(anyhow!("HTTP 416 (discarded stale .part; retry starts clean)"));
+    }
     if !status.is_success() {
         return Err(anyhow!("HTTP {}", status));
     }
@@ -246,6 +272,12 @@ async fn try_one(
         ));
     }
 
+    finalize(entry, part, dest).await
+}
+
+/// Promote a verified `.part` to its final name. Split out so the "already complete"
+/// short-circuit above lands the file by exactly the same path a fresh download does.
+async fn finalize(entry: &FileEntry, part: &Path, dest: &Path) -> Result<()> {
     if tokio::fs::metadata(dest).await.is_ok() {
         let _ = tokio::fs::remove_file(dest).await;
     }
@@ -274,4 +306,95 @@ async fn set_exec_bit(_entry: &FileEntry, _dest: &Path) {}
 
 fn short_name(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::Header;
+
+    fn progress() -> Arc<Progress> {
+        Progress::new(0, 1, 1, vec![], Header::default())
+    }
+
+    fn blake2b_256(bytes: &[u8]) -> String {
+        let mut h = Hasher::new("blake2b-256").unwrap();
+        h.update(bytes);
+        h.hex()
+    }
+
+    fn entry(path: &str, bytes: &[u8]) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            size: bytes.len() as u64,
+            hash: blake2b_256(bytes),
+            component: String::new(),
+            platform: "all".to_string(),
+            exec: false,
+        }
+    }
+
+    /// A .part holding every byte is a finished download interrupted before the rename.
+    /// It must be promoted locally, with no request: resuming from EOF asks for an
+    /// unsatisfiable range and the server answers 416, which used to fail permanently
+    /// because the .part never shrank and every re-run recomputed the same offset.
+    #[tokio::test]
+    async fn complete_part_is_promoted_without_touching_the_network() {
+        let dir = std::env::temp_dir().join(format!("ql-dl-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let dest = dir.join("complete.bin");
+        let part = dir.join("complete.bin.part");
+        let body = b"the whole file, already on disk";
+        tokio::fs::write(&part, body).await.unwrap();
+
+        // Deliberately unroutable: reaching the network at all is the failure this guards.
+        let res = try_one(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1/never",
+            "blake2b-256",
+            &entry("complete.bin", body),
+            &part,
+            &dest,
+            &progress(),
+            0,
+            None,
+        )
+        .await;
+
+        assert!(res.is_ok(), "expected local promotion, got {:?}", res.err());
+        assert_eq!(tokio::fs::read(&dest).await.unwrap(), body);
+        assert!(!part.exists(), ".part should be renamed away, not left behind");
+        let _ = tokio::fs::remove_file(&dest).await;
+    }
+
+    /// Full length but wrong bytes has nothing to resume from, so the .part must be
+    /// discarded rather than range-requested past EOF.
+    #[tokio::test]
+    async fn complete_but_corrupt_part_is_discarded() {
+        let dir = std::env::temp_dir().join(format!("ql-dl-c-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let dest = dir.join("corrupt.bin");
+        let part = dir.join("corrupt.bin.part");
+        tokio::fs::write(&part, b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx").await.unwrap();
+
+        let res = try_one(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1/never",
+            "blake2b-256",
+            &entry("corrupt.bin", b"the whole file, already on disk"),
+            &part,
+            &dest,
+            &progress(),
+            0,
+            None,
+        )
+        .await;
+
+        // It must fail on the connection, NOT on a 416: that proves it reset the offset
+        // to 0 and issued a plain GET instead of resuming from a bad partial.
+        assert!(res.is_err());
+        let msg = res.unwrap_err().to_string();
+        assert!(!msg.contains("416"), "should not have range-requested: {msg}");
+        assert!(!dest.exists());
+    }
 }
