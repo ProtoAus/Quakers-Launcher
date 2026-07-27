@@ -1,0 +1,17 @@
+[Unit]
+Description=Point a DNS-only Cloudflare A record at this box's current public IP
+Documentation=https://github.com/ProtoAus/Quakers-Launcher/blob/main/deploy/cf-ddns.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cf-ddns.sh
+# The token is a bearer credential with DNS-edit rights on the whole zone, so the unit
+# gets the cheap hardening that costs nothing for a script that only runs curl.
+User=root
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

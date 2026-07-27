@@ -1,0 +1,14 @@
+[Unit]
+Description=Check the public IP for Cloudflare DDNS every 5 minutes
+
+[Timer]
+# Run shortly after boot too: an ISP reconnect and a reboot often coincide, and that is
+# exactly the moment the record is stale.
+OnBootSec=2min
+OnUnitActiveSec=5min
+# Without this, every machine running this timer wakes on the same wall-clock boundary.
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target
