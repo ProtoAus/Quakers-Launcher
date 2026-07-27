@@ -27,6 +27,8 @@ import datetime
 import hashlib
 import json
 import os
+import re
+import struct
 import time
 import zipfile
 
@@ -162,7 +164,94 @@ def build_pk3_texture_index(gamedir):
     return stems
 
 
-def skip_reason(rel, name, ext, pk3_tex=frozenset()):
+def map_referenced_textures(gamedir):
+    """Texture basenames the shipped content actually asks for.
+
+    The loose textures/ tree is a map-editor palette (AmbientCG-style sets used from
+    TrenchBroom), so most of it belongs to maps that are still in development rather
+    than to anything being shipped. This collects what the shipped content references:
+
+      * Q1 / HL BSP  -- miptex names in the texture lump
+      * Source VBSP  -- the texdata string table
+      * loose text assets (.skin/.shader/.mat/.txt/.cfg) -- any token that looks like a
+        texture path, so model skins and material scripts keep their textures
+
+    Returned names are lowercase, extensionless basenames.
+    """
+    refs = set()
+
+    def q1_miptex(path, data):
+        ver = struct.unpack_from("<i", data, 0)[0]
+        if ver not in (29, 30):
+            return
+        off, _ln = struct.unpack_from("<ii", data, 4 + 2 * 8)   # lump 2 = textures
+        n = struct.unpack_from("<i", data, off)[0]
+        if not (0 < n < 65536):
+            return
+        for i in range(n):
+            d = struct.unpack_from("<i", data, off + 4 + 4 * i)[0]
+            if d < 0:
+                continue
+            nm = data[off + d:off + d + 16].split(b"\0")[0].decode("latin-1").lower()
+            if nm:
+                refs.add(nm)
+
+    def vbsp_texdata(path, data):
+        # Source BSP: lump 43 is LUMP_TEXDATA_STRING_DATA, a run of NUL-terminated names.
+        off, ln = struct.unpack_from("<ii", data, 8 + 43 * 16)
+        if not (0 < ln < 4 * 1024 * 1024) or off + ln > len(data):
+            return
+        for tok in data[off:off + ln].split(b"\0"):
+            if tok:
+                refs.add(os.path.basename(tok.decode("latin-1").lower().replace("\\", "/")))
+
+    mapdir = os.path.join(gamedir, "maps")
+    if os.path.isdir(mapdir):
+        for fn in os.listdir(mapdir):
+            if not fn.lower().endswith(".bsp"):
+                continue
+            p = os.path.join(mapdir, fn)
+            try:
+                with open(p, "rb") as f:
+                    data = f.read()
+                if data[:4] in (b"VBSP", b"RBSP", b"IBSP", b"FBSP"):
+                    vbsp_texdata(p, data)
+                else:
+                    q1_miptex(p, data)
+            except Exception:
+                # an unparseable map must never silently drop its textures
+                raise
+
+    # model skins / material scripts / cfgs naming textures directly
+    TEXTREF_EXT = {".skin", ".shader", ".mat", ".txt", ".cfg", ".particles", ".framegroups"}
+    for dirpath, dirnames, filenames in os.walk(gamedir):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for fn in filenames:
+            if os.path.splitext(fn)[1].lower() not in TEXTREF_EXT:
+                continue
+            try:
+                with open(os.path.join(dirpath, fn), "r", encoding="utf-8", errors="ignore") as f:
+                    body = f.read(1 << 20)
+            except OSError:
+                continue
+            for tok in re.findall(r"[A-Za-z0-9_{}!+#\-/\\.]{3,128}", body):
+                tok = tok.lower().replace("\\", "/")
+                refs.add(os.path.splitext(os.path.basename(tok))[0])
+
+    # Quake names liquid textures `*water1`, but `*` is illegal in a filename, so the
+    # on-disk replacement is `!water1.png`. Match both spellings or a trim would delete
+    # every loose water/lava/teleport texture while the map still asks for it.
+    for n in list(refs):
+        if n.startswith("*"):
+            refs.add("!" + n[1:])
+        elif n.startswith("!"):
+            refs.add("*" + n[1:])
+
+    refs.discard("")
+    return refs
+
+
+def skip_reason(rel, name, ext, pk3_tex=frozenset(), used_tex=None):
     """Return a short reason string if this gamedir-relative file should be skipped, else None."""
     low = name.lower()
     relslash = rel.replace("\\", "/")
@@ -183,6 +272,11 @@ def skip_reason(rel, name, ext, pk3_tex=frozenset()):
     # loose textures NOT in any pk3 are kept (they'd otherwise vanish from maps).
     if top == "textures" and ext in IMG_EXT and (_stem_forms(relslash) & pk3_tex):
         return "tex-in-pk3"
+    # loose editor-palette textures no shipped map/skin/material actually references
+    # (opt-in: --trim-unused-textures)
+    if used_tex is not None and top == "textures" and ext in IMG_EXT:
+        if os.path.splitext(os.path.basename(relslash))[0] not in used_tex:
+            return "tex-unused"
     # loose screenshot PNGs dumped at the gamedir root
     if ext == ".png" and "/" not in relslash:
         return "root-screenshot"
@@ -196,7 +290,7 @@ def skip_reason(rel, name, ext, pk3_tex=frozenset()):
 
 # ---- walk ------------------------------------------------------------------
 
-def collect(install_root, gamedir, gamedir_name, platforms):
+def collect(install_root, gamedir, gamedir_name, platforms, used_tex=None):
     """Return (entries, skipped).
 
     entries = list of (abspath, manifest_path, component, platform, needs_exec_bit).
@@ -229,7 +323,7 @@ def collect(install_root, gamedir, gamedir_name, platforms):
             ap = os.path.join(dirpath, fn)
             rel = os.path.relpath(ap, gamedir)
             ext = os.path.splitext(fn)[1].lower()
-            reason = skip_reason(rel, fn, ext, pk3_tex)
+            reason = skip_reason(rel, fn, ext, pk3_tex, used_tex)
             if reason:
                 skipped.append((rel, reason))
                 continue
@@ -339,6 +433,11 @@ def main():
     ap.add_argument("--report-only", action="store_true",
                     help="classify + size only; no hashing, no manifest, no objects")
     ap.add_argument("--jobs", type=int, default=min(8, (os.cpu_count() or 4)))
+    ap.add_argument("--trim-unused-textures", action="store_true",
+                    help="drop loose textures/ images that no shipped map, model skin or "
+                         "material script references. The loose tree is a map-EDITOR palette, "
+                         "so most of it belongs to maps still in development. Opt-in: verify "
+                         "the excluded.txt 'tex-unused' list before shipping with this on.")
     ap.add_argument("--verify-objects", action="store_true",
                     help="re-hash every blob in objects/ and check it still matches its own "
                          "filename, then exit. Objects are HARDLINKED to their sources, so "
@@ -386,7 +485,11 @@ def main():
     print(f"channel/ver  : {args.channel} / {version}\n")
 
     t0 = time.time()
-    entries, skipped = collect(args.install_root, args.gamedir, gamedir_name, platforms)
+    used_tex = None
+    if args.trim_unused_textures:
+        used_tex = map_referenced_textures(args.gamedir)
+        print(f"texture refs : {len(used_tex)} names referenced by shipped maps/skins/materials")
+    entries, skipped = collect(args.install_root, args.gamedir, gamedir_name, platforms, used_tex)
 
     # size classification report
     by_top = {}

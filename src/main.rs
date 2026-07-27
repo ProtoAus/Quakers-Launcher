@@ -55,6 +55,10 @@ struct Args {
     /// Render a sample progress frame and exit (preview the UI layout).
     #[arg(long, hide = true)]
     ui_preview: bool,
+
+    /// Install straight into the current folder even if it's a Desktop/Downloads/drive root.
+    #[arg(long)]
+    allow_unsafe_dir: bool,
 }
 
 #[tokio::main]
@@ -88,7 +92,21 @@ fn pause_on_exit() {
 
 async fn run(args: Args) -> Result<()> {
     print_banner();
-    let install_dir = args.install_dir.clone().unwrap_or_else(default_install_dir);
+    let requested = args.install_dir.clone().unwrap_or_else(default_install_dir);
+    let (install_dir, redirected) = resolve_install_dir(requested, args.allow_unsafe_dir);
+    if let Some(why) = &redirected {
+        println!();
+        println!(
+            "  {} This looks like {}, not a place to unpack a 6 GB game.",
+            "!".yellow().bold(),
+            why.clone().yellow()
+        );
+        println!("    Installing into {} instead.", fwd(&install_dir).cyan().bold());
+        println!(
+            "    {}",
+            "(move the launcher in there too, or pass --allow-unsafe-dir to override)".dark_grey()
+        );
+    }
     std::fs::create_dir_all(&install_dir).ok();
 
     if args.launch_only {
@@ -281,6 +299,76 @@ fn launch_game(install_dir: &Path, cmd: &str, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Subfolder created when the launcher is run from somewhere it shouldn't install into.
+const INSTALL_FOLDER_NAME: &str = "Quakers";
+
+/// Folder names that are containers for *other* things, never a home for an install.
+/// Matched on the basename, so OneDrive/Dropbox-redirected Desktops are caught too.
+const CONTAINER_NAMES: &[&str] = &[
+    "desktop", "downloads", "download", "documents", "pictures", "music", "videos",
+    "public", "onedrive", "dropbox", "google drive", "icloud drive",
+];
+
+/// Why `dir` is a bad place to unpack ~5,000 files, or None if it's fine.
+///
+/// The failure this prevents: someone drops the launcher on their Desktop and double-clicks
+/// it. The install dir defaults to the launcher's own folder, so the entire game — a
+/// `quakers/` tree plus the engine binaries — lands loose on the Desktop, interleaved with
+/// everything else they own and effectively impossible to tidy up afterwards. A drive root
+/// is worse still.
+///
+/// `home` is passed in rather than read from the environment so this is testable.
+fn container_reason_in(dir: &Path, home: Option<&Path>) -> Option<String> {
+    if dir.parent().is_none() {
+        return Some("a drive root".to_string());
+    }
+    // On Windows a drive root can also appear as "C:\" with a trailing component.
+    if dir.components().count() <= 1 {
+        return Some("a drive root".to_string());
+    }
+    if let Some(h) = home {
+        if dir == h {
+            return Some("your home folder".to_string());
+        }
+    }
+    let base = dir
+        .file_name()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if CONTAINER_NAMES.contains(&base.as_str()) {
+        return Some(format!("your {} folder", base.trim_end_matches('s')));
+    }
+    // Windows system locations
+    let lower = dir.to_string_lossy().to_lowercase().replace('\\', "/");
+    for sys in ["/windows", "/program files", "/program files (x86)", "/programdata"] {
+        if lower.contains(sys) {
+            return Some("a system folder".to_string());
+        }
+    }
+    None
+}
+
+fn container_reason(dir: &Path) -> Option<String> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    container_reason_in(dir, home.as_deref())
+}
+
+/// Apply the guard: if `requested` is a container folder, install into a subfolder of it.
+fn resolve_install_dir(requested: PathBuf, allow_unsafe: bool) -> (PathBuf, Option<String>) {
+    if allow_unsafe {
+        return (requested, None);
+    }
+    match container_reason(&requested) {
+        Some(why) => {
+            let sub = requested.join(INSTALL_FOLDER_NAME);
+            (sub, Some(why))
+        }
+        None => (requested, None),
+    }
+}
+
 fn default_install_dir() -> PathBuf {
     std::env::current_exe()
         .ok()
@@ -343,6 +431,94 @@ fn fwd(p: &Path) -> String {
 fn kv(label: &str, value: &str) {
     let l = format!("{:<11}", label);
     println!("  {} {}", l.green().bold(), value.cyan());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn home() -> PathBuf {
+        PathBuf::from(if cfg!(windows) { r"C:\Users\Lex" } else { "/home/lex" })
+    }
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    #[test]
+    fn rejects_container_folders() {
+        let h = home();
+        let bad = if cfg!(windows) {
+            vec![
+                r"C:\Users\Lex\Desktop",
+                r"C:\Users\Lex\Downloads",
+                r"C:\Users\Lex\Documents",
+                r"C:\Users\Lex\Pictures",
+                r"C:\Users\Lex\OneDrive\Desktop",   // redirected Desktop
+                r"C:\Users\Lex\OneDrive",
+                r"C:\Users\Lex",                    // the home folder itself
+                r"C:\",                             // drive root
+                r"C:\Program Files\Quakers",        // system location
+                r"C:\Windows\Temp",
+            ]
+        } else {
+            vec![
+                "/home/lex/Desktop",
+                "/home/lex/Downloads",
+                "/home/lex/Documents",
+                "/home/lex",
+                "/",
+            ]
+        };
+        for b in bad {
+            assert!(
+                container_reason_in(&p(b), Some(&h)).is_some(),
+                "should have been rejected: {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_real_install_dirs() {
+        let h = home();
+        let good = if cfg!(windows) {
+            vec![
+                r"C:\Users\Lex\Desktop\Quakers",  // the redirect target itself
+                r"C:\Games\Quakers",
+                r"C:\Users\Lex\quakerstest",
+                r"D:\Quakers",
+            ]
+        } else {
+            vec!["/home/lex/Desktop/Quakers", "/home/lex/games/quakers", "/opt/quakers"]
+        };
+        for g in good {
+            assert!(
+                container_reason_in(&p(g), Some(&h)).is_none(),
+                "should have been accepted: {g}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_creates_one_level_and_is_stable() {
+        let h = home();
+        let desktop = if cfg!(windows) { r"C:\Users\Lex\Desktop" } else { "/home/lex/Desktop" };
+        let (dir, why) = resolve_install_dir(p(desktop), false);
+        assert!(why.is_some());
+        assert_eq!(dir.file_name().unwrap(), INSTALL_FOLDER_NAME);
+        // and the redirect target must not itself redirect -- no Quakers/Quakers nesting
+        assert!(container_reason_in(&dir, Some(&h)).is_none());
+        let (again, why2) = resolve_install_dir(dir.clone(), false);
+        assert_eq!(again, dir);
+        assert!(why2.is_none());
+    }
+
+    #[test]
+    fn override_flag_disables_the_guard() {
+        let desktop = if cfg!(windows) { r"C:\Users\Lex\Desktop" } else { "/home/lex/Desktop" };
+        let (dir, why) = resolve_install_dir(p(desktop), true);
+        assert_eq!(dir, p(desktop));
+        assert!(why.is_none());
+    }
 }
 
 fn print_banner() {
