@@ -225,10 +225,40 @@ async fn try_one(
     wid: usize,
     cat: Option<usize>,
 ) -> Result<()> {
-    let mut offset: u64 = tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
-    if offset > entry.size {
-        offset = 0;
+    // `None` when there is no .part at all. That distinction matters: an empty manifest entry
+    // and a missing file both measure 0 bytes, and conflating them made every zero-byte file
+    // fail with a rename of something that was never created (os error 2 / ENOENT).
+    let part_len: Option<u64> = tokio::fs::metadata(part).await.ok().map(|m| m.len());
+
+    // A .part that EXISTS and already holds exactly `size` bytes is not a resume -- it is a
+    // finished download interrupted between its last write and the rename below. Do NOT
+    // range-request from here: `Range: bytes=<size>-` starts at EOF, which RFC 7233 defines as
+    // unsatisfiable, so the server answers 416 and that failure is permanent -- nothing shrinks
+    // the .part, so every retry recomputes the same offset and asks for the same bad range.
+    // The bytes are already local, so this needs no request at all.
+    if part_len == Some(entry.size) {
+        let mut whole = Hasher::new(algo)?;
+        let mut f = tokio::fs::File::open(part).await?;
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let read = f.read(&mut buf).await?;
+            if read == 0 {
+                break;
+            }
+            whole.update(&buf[..read]);
+        }
+        drop(f);
+        if whole.hex() == entry.hash {
+            progress.worker_set_cur(wid, entry.size);
+            return finalize(entry, part, dest).await;
+        }
+        // Right length, wrong bytes: there is no valid prefix to resume from. Start clean.
+        let _ = tokio::fs::remove_file(part).await;
     }
+
+    // Resume only from a partial that is genuinely shorter than the target. Anything else
+    // (absent, complete-but-corrupt, or somehow longer) restarts at zero.
+    let mut offset: u64 = part_len.filter(|&l| l < entry.size).unwrap_or(0);
 
     // Reconstruct hasher state from the existing prefix.
     let mut hasher = Hasher::new(algo)?;
@@ -248,24 +278,6 @@ async fn try_one(
         offset = fed;
     }
     progress.worker_set_cur(wid, offset);
-
-    // A .part holding every byte is not a resume -- it is a finished download that was
-    // interrupted between the last write and the rename below. Do NOT range-request from
-    // here: `Range: bytes=<size>-` starts at EOF, which RFC 7233 defines as unsatisfiable,
-    // so the server answers 416 and the old code reported a hard failure that re-running
-    // could never clear (the .part never shrank, so every retry asked for the same range).
-    // The bytes are already local, so this needs no request at all.
-    if offset == entry.size {
-        let got = hasher.hex();
-        if got == entry.hash {
-            return finalize(entry, part, dest).await;
-        }
-        // Full length but wrong content: nothing to resume from. Discard and refetch clean.
-        let _ = tokio::fs::remove_file(part).await;
-        offset = 0;
-        hasher = Hasher::new(algo)?;
-        progress.worker_set_cur(wid, 0);
-    }
 
     let mut req = client.get(url);
     if offset > 0 {
@@ -528,6 +540,70 @@ Content-Length: 0
 
         assert!(res.is_err());
         assert_eq!(hits.load(Ordering::SeqCst), 1, "404 must not be retried");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A zero-byte manifest entry with no .part on disk: "already have every byte" and
+    /// "have nothing at all" both measure 0. Conflating them made the launcher rename a
+    /// .part that was never created — os error 2 — and, like the 416, it was permanent,
+    /// because nothing about the state changed between runs. Two real files hit this:
+    /// quakers/gibfiltr.cfg and quakers/impfiltr.cfg.
+    #[tokio::test]
+    async fn zero_byte_files_are_downloaded_not_renamed_from_nothing() {
+        let empty: Vec<u8> = Vec::new();
+        let (base, hits, port) = flaky_server(0, empty.clone()).await;
+        let dir = std::env::temp_dir().join(format!("ql-zero-{}-{}", std::process::id(), port));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let dest = dir.join("gibfiltr.cfg");
+
+        let res = download_object(
+            &reqwest::Client::new(),
+            &[base],
+            "blake2b-256",
+            &entry("gibfiltr.cfg", &empty),
+            &dest,
+            &progress(),
+            0,
+            None,
+        )
+        .await;
+
+        assert!(res.is_ok(), "zero-byte file failed: {:?}", res.err());
+        assert_eq!(tokio::fs::metadata(&dest).await.unwrap().len(), 0);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "it must actually fetch, not short-circuit");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A .part longer than the manifest says must not be promoted just because a reset made
+    /// the offset coincide with a zero-length target.
+    #[tokio::test]
+    async fn oversized_part_is_not_promoted() {
+        let empty: Vec<u8> = Vec::new();
+        let (base, _hits, port) = flaky_server(0, empty.clone()).await;
+        let dir = std::env::temp_dir().join(format!("ql-over-{}-{}", std::process::id(), port));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let dest = dir.join("over.cfg");
+        let part = dir.join("over.cfg.part");
+        tokio::fs::write(&part, b"leftover junk from a previous build").await.unwrap();
+
+        let res = download_object(
+            &reqwest::Client::new(),
+            &[base],
+            "blake2b-256",
+            &entry("over.cfg", &empty),
+            &dest,
+            &progress(),
+            0,
+            None,
+        )
+        .await;
+
+        assert!(res.is_ok(), "{:?}", res.err());
+        assert_eq!(
+            tokio::fs::metadata(&dest).await.unwrap().len(),
+            0,
+            "the 35-byte leftover must not have been installed as the file"
+        );
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
