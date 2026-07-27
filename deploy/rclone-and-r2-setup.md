@@ -241,12 +241,16 @@ After pushing `dist/launcher/`, purge those URLs:
 - Dashboard → **Caching → Configuration → Purge Cached Content → Custom Purge**, then paste:
   `https://dl.proto.bar/launcher/quakers-launcher.exe`
   `https://dl.proto.bar/launcher/quakers-launcher`
-- Verify with a cache-buster, which always bypasses the edge:
+- Verify by **hashing the bytes**, not by comparing `content-length`:
   ```bash
-  curl -sI "https://dl.proto.bar/launcher/quakers-launcher.exe?cb=$RANDOM" | grep -i content-length  # origin
-  curl -sI "https://dl.proto.bar/launcher/quakers-launcher.exe"            | grep -iE 'content-length|cf-cache-status'
+  curl -s "https://dl.proto.bar/launcher/quakers-launcher.exe" | sha256sum
+  sha256sum dist/launcher/quakers-launcher.exe
   ```
-  The two `content-length` values must match. If they don't, the purge hasn't taken.
+  They must match. `content-length` is not a sufficient check and gave a false pass on the
+  0.1.0 → 0.1.1 push: both builds were **exactly** 3732992 bytes, because the only source
+  change was a version string of the same length. A stale HIT looked identical to a fresh one
+  on every header — `age` was the sole tell, and `age` alone cannot distinguish "stale" from
+  "purged, then re-cached seconds ago".
 
 The permanent fix is to give the launcher a versioned filename
 (`quakers-launcher-2026.07.27.exe`) plus a stable redirect, so it becomes immutable like the
@@ -262,6 +266,12 @@ itself before it exists. `dist/launcher/` holds what testers need; after the pus
 | Windows | `https://dl.proto.bar/launcher/quakers-launcher.exe` |
 | Linux | `https://dl.proto.bar/launcher/quakers-launcher` |
 | both | `https://dl.proto.bar/launcher/launcher.toml` (optional — mirrors are baked in) |
+
+**Or hand out the GitHub release instead** — <https://github.com/ProtoAus/Quakers-Launcher/releases>.
+Assets there are versioned per tag (`quakers-launcher-v0.1.1-windows-x64.exe`), so they are
+immutable and cannot go stale: it is the versioned-filename fix above, already available, without
+needing the redirect. The `dl.proto.bar` links stay because they are stable and short, but they are
+the ones that require the purge.
 
 Tell them: put it in an empty folder and run it. On Linux, `chmod +x quakers-launcher` first — that
 is the *only* chmod a tester ever has to do; the launcher sets `+x` on everything it downloads.
