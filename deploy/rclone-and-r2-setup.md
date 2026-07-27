@@ -220,18 +220,32 @@ MSYS_NO_PATHCONV=1 wsl -d Ubuntu-22.04 -- bash /mnt/c/FTEQuake/launcher/deploy/b
 # 1. Build manifest + object tree (both platforms):
 python publish.py --prune --channel alpha --version 2026.07.27_1
 
-# 2. Objects FIRST (content-addressed, so this is purely additive):
-rclone sync dist/objects   r2:quakers-dl/objects   --checksum --transfers=16 --fast-list
-rclone sync dist/objects   pi:/srv/nvme/quakers/dl/objects --checksum --transfers=8
+# 2. Push everything to R2 -- objects, then launcher, then manifest last, which is the
+#    atomic switch that makes the release live. Ordering is enforced by the script:
+.\deploy\r2-push.ps1
 
-# 3. The launcher binaries themselves (only when the launcher changes — see below):
-rclone copy dist/launcher  r2:quakers-dl/launcher
-rclone copy dist/launcher  pi:/srv/nvme/quakers/dl/launcher
-
-# 4. Manifest LAST — this is the atomic switch that makes the release live:
-rclone copy dist/manifests r2:quakers-dl/manifests
-rclone copy dist/manifests pi:/srv/nvme/quakers/dl/manifests
+#    Useful variants:
+.\deploy\r2-push.ps1 -DryRun          # show what would transfer
+.\deploy\r2-push.ps1 -BwLimit 0       # no upload throttle (only when nobody is playing)
 ```
+
+The script uses `rclone copy`, never `sync`. `sync` deletes on the destination, so a half-built
+`dist/` — or one bad `--exclude` — would remove live objects out from under testers who are
+mid-download. Orphans get pruned deliberately and separately, well after a manifest has gone live.
+
+**Measured on the first full push (2026-07-27):** 4,107 objects / 5.84 GB in **51 minutes** at
+~1.95 MiB/s, throttled with `-BwLimit 2M`. The throttle was not the binding constraint — the home
+upstream was. Verified afterwards with `rclone check --size-only` (zero differences) plus a
+BLAKE2b-256 round-trip on three objects including a 474 MB multipart upload.
+
+> **`--bind 0.0.0.0` is not optional on this network.** AAAA records resolve but there is no
+> working IPv6 path, and Go's happy-eyeballs will try v6 first. The symptom is
+> `tls: handshake failure` from rclone, which looks exactly like a bad API token and is not.
+> Confirmed by `curl -6` failing to `dl.proto.bar` as well. It is baked into `r2-push.ps1`.
+
+> **`no_check_bucket = true` is required for a bucket-scoped token.** rclone otherwise probes with
+> `CreateBucket` before its first upload and gets a 403 — again indistinguishable from bad
+> credentials. Set on the `r2` remote already.
 
 ### ⚠ Purge the CDN after step 3 — `.exe` is cached for 4 hours
 

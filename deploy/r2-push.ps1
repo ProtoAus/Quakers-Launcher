@@ -39,6 +39,11 @@ if (-not ((rclone listremotes) -match "^${Remote}:")) {
 }
 
 $common = @(
+    # Force IPv4. This network returns AAAA records but has no working IPv6 path -- verified
+    # 2026-07-27: `curl -6` fails to BOTH the R2 endpoint and dl.proto.bar, while `curl -4`
+    # succeeds to both. Without this, Go's happy-eyeballs burns a timeout per connection and
+    # the failure surfaces as a bare "tls: handshake failure" that looks like a bad token.
+    '--bind', '0.0.0.0',
     '--transfers', '8',
     '--checkers', '16',
     '--s3-chunk-size', '32M',

@@ -10,10 +10,10 @@ Ships **Windows x64 and Linux x64** from one manifest and one object tree.
 ```
   dev machine                         mirror                        tester
   -----------                         ------                        ------
-  publish.py  --tar|ssh-->  dl.proto.bar                      <-->  launcher.exe
-   (manifest +               = Cloudflare edge (cache)               (Rust TUI, resumable,
-    objects/)                   -> nginx on the proto.bar Pi          verify + repair)
-                                  /srv/nvme/quakers/dl
+  publish.py  --rclone-->  dl.proto.bar                       <-->  launcher.exe
+   (manifest +              = Cloudflare edge (cache)                (Rust TUI, resumable,
+    objects/)                  -> Cloudflare R2 `quakers-dl`          verify + repair)
+                             $0 egress, no home uplink in the path
 ```
 
 - **Content-addressed:** every shippable file is stored by its hash (`objects/<hh>/<hash>`). Unchanged
@@ -27,13 +27,18 @@ Ships **Windows x64 and Linux x64** from one manifest and one object tree.
   Entries flagged `"exec": true` get `chmod +x` on unix — without that the engine downloads
   byte-perfect and then won't start.
 - **Mirrors** are tried in order per file with automatic failover, but only **one** is configured:
-  `dl.proto.bar`, Cloudflare-proxied in front of nginx on the Pi. Cloudflare's edge absorbs the
-  repeat traffic so the Pi's 40 Mbps uplink (which also runs the live game server) only ever serves
-  each blob once. A second entry is worth adding when a second host actually exists — a hostname
-  that does not resolve is not a failover, it is a guaranteed connect timeout per file.
+  `dl.proto.bar` → Cloudflare **R2**. A second entry is worth adding when a second *host* exists —
+  a hostname that does not resolve is not a failover, it is a guaranteed connect timeout per file.
   **The `/objects/` Cache Rule is required, not an optimisation:** blobs are hash-named with no
   file extension, and Cloudflare's default caching is extension-driven, so without the rule every
-  request came back `cf-cache-status: DYNAMIC` and fell straight through to the origin.
+  request comes back `cf-cache-status: DYNAMIC`.
+- **Why not just put the CDN in front of the Pi?** That was the setup until 2026-07-27, when one
+  tester's install saturated the home uplink. The launcher had *not* bypassed Cloudflare — every
+  origin request came from a Cloudflare edge IP. But the edge cache is per-*server*, and the
+  launcher runs 8 parallel workers that land on different machines in the same PoP; each missed
+  and fetched from origin independently. The Pi served **6.20 GB to deliver a 5.84 GB payload**
+  (2.96× re-fetch). A CDN in front of a home connection does not remove the home connection from
+  the path. Enabling **Smart Tiered Cache** narrows it; moving the origin to R2 ends it.
 - FTE's own connect-time downloader stays on as a last-resort safety net (see `default.fmf`).
 
 ## What ships vs. what doesn't
@@ -61,9 +66,9 @@ Audit any run in `dist/included.txt` and `dist/excluded.txt`.
 | **Rust launcher, Linux** (`quakers-launcher`) | **Done, tested** — 4.1 MB ELF; links only libc/libm/libgcc (rustls+ring, *no* OpenSSL) |
 | **Linux engine** (`fteqw-gl64`, `fteqw-sv64`, box3d/hl2/cod plugins) | **Done, tested** — `deploy/build-linux.sh`; dedicated server boots the mod, loads box3d, spawns a map |
 | **Multi-platform manifest** (schema 2) | **Done, tested** — platform filtering + exec-bit verified end-to-end against a local mirror |
-| Pi mirror (nginx static off the NVMe) | **Live** — 4,107 objects on `/srv/nvme/quakers/dl`, in sync with `dist/`; see `deploy/nginx-quakers-dl.conf` |
-| Cloudflare in front of it | **Live** — nameserver cutover 2026-07-27; Cache Rule on `/objects/` verified MISS→HIT, including a 474 MB part |
-| Cloudflare R2 | **Not used.** The Pi + Cloudflare edge covers the alpha. Bucket steps kept in `deploy/rclone-and-r2-setup.md` for when a second mirror is worth it |
+| **Cloudflare R2** (`quakers-dl`) | **Live, verified** — 4,112 objects / 5.85 GB; `dl.proto.bar` is an R2 custom domain. A 32-file fetch through it added **0 lines** to the Pi's access log |
+| Cache Rule on `/objects/` | **Live** — verified MISS→HIT after the R2 cutover, including a 474 MB part. Note `curl -I` reports `DYNAMIC` on HEAD even when cached; judge it on GETs |
+| Pi mirror (nginx off the NVMe) | **Retired from serving.** Content still there, vhost kept but `limit_rate`d, and no DNS points at it. See `deploy/rclone-and-r2-setup.md` §0 for why |
 | Manifest signing + launcher self-update + code-signing | **TODO** (M3) |
 
 > **Cache ceiling.** Cloudflare's free plan will not cache a single object over 512 MB, so the

@@ -13,17 +13,26 @@ concurrency = 8            # parallel download workers (the per-thread rows in t
 
 # Tried in order, per file, with automatic failover on error.
 #
-#   dl.proto.bar   Cloudflare (proxied) in front of nginx on the Pi, serving /srv/nvme/quakers/dl.
-#                  The nameserver cutover to Cloudflare completed 2026-07-27, and a Cache Rule
-#                  (Hostname eq dl.proto.bar and starts_with(uri.path, "/objects/") -> Eligible
-#                  for cache) makes the edge actually hold the blobs. That rule is REQUIRED, not
-#                  optional: the objects are hash-named with no file extension, and Cloudflare's
-#                  default caching is extension-driven, so without it every request was
-#                  cf-cache-status: DYNAMIC and fell through to the Pi's uplink.
+#   dl.proto.bar   Cloudflare R2 (bucket `quakers-dl`) via an R2 custom domain. Egress is free
+#                  and there is no home connection behind it.
 #
-# Only ONE mirror is listed on purpose. A second entry is only useful if it resolves — a dead
-# hostname makes the launcher burn a connect timeout per file on any failover path. Add R2 (or a
-# second host) here when it actually exists; see deploy/rclone-and-r2-setup.md.
+#                  It pointed at nginx on the proto.bar Pi until 2026-07-27, when a single
+#                  tester's install took the house offline. The CDN was not bypassed -- every
+#                  origin hit came from a Cloudflare edge IP -- but Cloudflare's cache is
+#                  per-edge-SERVER, and the launcher opens 8 parallel workers that land on
+#                  different machines in one PoP. Each missed and fetched independently, so the
+#                  origin served 6.20 GB to deliver a 5.84 GB payload: a 2.96x re-fetch. Caching
+#                  in front of a home uplink does not take the uplink out of the path.
+#
+#                  The Cache Rule (Hostname eq dl.proto.bar and starts_with(uri.path,
+#                  "/objects/") -> Eligible for cache) still matters and carried over unchanged:
+#                  objects are hash-named with no file extension, and Cloudflare's default
+#                  caching is extension-driven, so without it every request is DYNAMIC.
+#
+# Only ONE mirror is listed on purpose, and it is deliberately NOT the Pi. A fallback pointing at
+# the home connection just re-creates the outage above, less often. A dead hostname is worse than
+# none -- the launcher burns a connect timeout per file on any path that reaches it. Add a second
+# entry when a second HOST exists; see deploy/rclone-and-r2-setup.md.
 mirrors = [
     "https://dl.proto.bar",
 ]
