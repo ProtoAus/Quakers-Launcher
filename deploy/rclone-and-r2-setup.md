@@ -16,7 +16,7 @@ $ nslookup -type=NS proto.bar 8.8.8.8
 proto.bar   nameserver = dns1.registrar-servers.com
 proto.bar   nameserver = dns2.registrar-servers.com     <- Namecheap, not Cloudflare
 
-$ curl -sI https://dl.proto.bar/manifests/beta.json
+$ curl -sI https://dl.proto.bar/manifests/alpha.json
 HTTP/1.1 200 OK
 Server: nginx/1.22.1          <- the Pi answering directly; no `cf-ray`, so NOT proxied
 ```
@@ -203,7 +203,7 @@ From `C:\FTEQuake\launcher`:
 MSYS_NO_PATHCONV=1 wsl -d Ubuntu-22.04 -- bash /mnt/c/FTEQuake/launcher/deploy/build-linux.sh
 
 # 1. Build manifest + object tree (both platforms):
-python publish.py --prune --channel beta --version 2026.07.27_1
+python publish.py --prune --channel alpha --version 2026.07.27_1
 
 # 2. Objects FIRST (content-addressed, so this is purely additive):
 rclone sync dist/objects   r2:quakers-dl/objects   --checksum --transfers=16 --fast-list
@@ -217,6 +217,40 @@ rclone copy dist/launcher  pi:/srv/nvme/quakers/dl/launcher
 rclone copy dist/manifests r2:quakers-dl/manifests
 rclone copy dist/manifests pi:/srv/nvme/quakers/dl/manifests
 ```
+
+### ⚠ Purge the CDN after step 3 — `.exe` is cached for 4 hours
+
+Content blobs are safe: their names are hashes, so a changed file is a *different* URL and can
+never be served stale. The **launcher binaries are not** — `quakers-launcher.exe` keeps the same
+URL forever, and `.exe` is on Cloudflare's default-cached extension list. Observed on the
+2026-07-27 alpha push, minutes after uploading a new build:
+
+```
+Content-Length: 3695616      ← the PREVIOUS build
+Age: 1032
+Cache-Control: max-age=14400 ← 4 hours
+cf-cache-status: HIT
+```
+
+The origin had the new 3732992-byte binary the whole time; every tester would have downloaded the
+old one for the next four hours. `quakers-launcher` (Linux, no extension) is *not* cached and
+updated immediately — so the two platforms silently drift apart.
+
+After pushing `dist/launcher/`, purge those URLs:
+
+- Dashboard → **Caching → Configuration → Purge Cached Content → Custom Purge**, then paste:
+  `https://dl.proto.bar/launcher/quakers-launcher.exe`
+  `https://dl.proto.bar/launcher/quakers-launcher`
+- Verify with a cache-buster, which always bypasses the edge:
+  ```bash
+  curl -sI "https://dl.proto.bar/launcher/quakers-launcher.exe?cb=$RANDOM" | grep -i content-length  # origin
+  curl -sI "https://dl.proto.bar/launcher/quakers-launcher.exe"            | grep -iE 'content-length|cf-cache-status'
+  ```
+  The two `content-length` values must match. If they don't, the purge hasn't taken.
+
+The permanent fix is to give the launcher a versioned filename
+(`quakers-launcher-2026.07.27.exe`) plus a stable redirect, so it becomes immutable like the
+blobs. Until then, purging is a required step of every launcher release.
 
 ### How testers get the launcher
 
@@ -240,15 +274,15 @@ pushes just what changed (a new `csprogs.dat` is ~8 MB, not 6.3 GB). Publishing 
 guarantees a client never sees a manifest referencing an object that is not uploaded yet.
 
 **Roll back** by re-copying a previous manifest — keep dated copies, e.g.
-`manifests/beta-2026.07.27_1.json`.
+`manifests/alpha-2026.07.27_1.json`.
 
 ---
 
 ## 9. Validate without the launcher
 
 ```bash
-curl -sI https://dl.proto.bar/manifests/beta.json          # 200
-curl -s  https://dl.proto.bar/manifests/beta.json | python -c "import sys,json;m=json.load(sys.stdin);print(m['schema'],m['total_files'],'files',round(m['total_bytes']/1e9,2),'GB',m.get('platforms'))"
+curl -sI https://dl.proto.bar/manifests/alpha.json          # 200
+curl -s  https://dl.proto.bar/manifests/alpha.json | python -c "import sys,json;m=json.load(sys.stdin);print(m['schema'],m['total_files'],'files',round(m['total_bytes']/1e9,2),'GB',m.get('platforms'))"
 
 # an object, and prove Range/resume works (must be 206):
 H=<some hash from the manifest>

@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use quakers_launcher::{config, download, manifest, plan, state, ui};
+use quakers_launcher::{confirm, config, download, manifest, plan, state, ui};
 use ratatui::crossterm::style::Stylize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -20,8 +20,9 @@ struct Args {
     #[arg(long)]
     install_dir: Option<PathBuf>,
 
-    /// Release channel.
-    #[arg(long, default_value = "beta")]
+    /// Release channel. Shown verbatim in the launcher header, so it is player-facing:
+    /// "alpha" for the Alpha release. Keep in step with publish.py's --channel default.
+    #[arg(long, default_value = "alpha")]
     channel: String,
 
     /// Override mirror base URL(s); repeatable. Falls back to launcher.toml, then the manifest.
@@ -59,6 +60,10 @@ struct Args {
     /// Install straight into the current folder even if it's a Desktop/Downloads/drive root.
     #[arg(long)]
     allow_unsafe_dir: bool,
+
+    /// Skip the "Download?" confirmation and start immediately (for scripts/CI).
+    #[arg(long, short = 'y')]
+    yes: bool,
 }
 
 #[tokio::main]
@@ -212,6 +217,28 @@ async fn run(args: Args) -> Result<()> {
             "To fetch",
             &format!("{} files · {:.2} GB", the_plan.to_download.len(), the_plan.bytes_to_download as f64 / 1e9),
         );
+
+        // Ask before writing gigabytes. A fresh install and a resume are different
+        // decisions, so they get different wording. Enter is what opens the progress view.
+        let prompt = if the_plan.up_to_date == 0 {
+            confirm::Prompt::Fresh {
+                dir: fwd(&install_dir),
+                files: the_plan.to_download.len(),
+                bytes: the_plan.bytes_to_download,
+            }
+        } else {
+            confirm::Prompt::Resume {
+                dir: fwd(&install_dir),
+                files: the_plan.to_download.len(),
+                bytes: the_plan.bytes_to_download,
+                have: the_plan.up_to_date as usize,
+            }
+        };
+        if !confirm::ask(&prompt, args.yes) {
+            println!("  {}", "Cancelled — nothing was downloaded.".yellow());
+            return Ok(());
+        }
+
         println!();
         let outcome = download::download_all(
             client.clone(),
@@ -411,7 +438,7 @@ fn human(b: u64) -> String {
     format!("{:.1} {}", v, U[i])
 }
 
-/// "https://dl.proto.bar/manifests/beta.json" -> "dl.proto.bar", so the header shows
+/// "https://dl.proto.bar/manifests/alpha.json" -> "dl.proto.bar", so the header shows
 /// which mirror answered without wrapping the whole URL.
 fn host_of(url: &str) -> String {
     url.split("://")

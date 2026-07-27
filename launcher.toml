@@ -7,27 +7,25 @@
 # Only `mirrors` is read today; the others are documented for the signing/self-update work (M3)
 # and are ignored for now. CLI flags (--mirror, --channel, --concurrency, --install-dir) override.
 
-channel     = "beta"
+channel     = "alpha"
 install_dir = "."          # "." = alongside the launcher binary; the whole game lives here
 concurrency = 8            # parallel download workers (the per-thread rows in the progress UI)
 
 # Tried in order, per file, with automatic failover on error.
 #
-#   dl.proto.bar     Cloudflare R2 — PRIMARY. $0 egress at any volume, global edge, and it keeps
-#                    the launch spike off the Pi's 40 Mbps uplink (which also carries the live
-#                    game server). NOT LIVE YET: proto.bar still delegates to Namecheap, so the
-#                    Cloudflare zone is Pending and no R2 custom domain can be attached.
-#                    See deploy/rclone-and-r2-setup.md §0.
-#   files.proto.bar  The Pi, nginx off the NVMe — FAILOVER. Grey-clouded (DNS only) on purpose:
-#                    Cloudflare's CDN terms cover bulk non-Cloudflare-hosted files at their
-#                    discretion, and R2 is the sanctioned path for that traffic.
+#   dl.proto.bar   Cloudflare (proxied) in front of nginx on the Pi, serving /srv/nvme/quakers/dl.
+#                  The nameserver cutover to Cloudflare completed 2026-07-27, and a Cache Rule
+#                  (Hostname eq dl.proto.bar and starts_with(uri.path, "/objects/") -> Eligible
+#                  for cache) makes the edge actually hold the blobs. That rule is REQUIRED, not
+#                  optional: the objects are hash-named with no file extension, and Cloudflare's
+#                  default caching is extension-driven, so without it every request was
+#                  cf-cache-status: DYNAMIC and fell through to the Pi's uplink.
 #
-# UNTIL THE NAMESERVERS ARE SWITCHED, dl.proto.bar is still the Pi's own A record and works as-is —
-# so this list is correct today and stays correct after the cutover; only the box answering
-# dl.proto.bar changes.
+# Only ONE mirror is listed on purpose. A second entry is only useful if it resolves — a dead
+# hostname makes the launcher burn a connect timeout per file on any failover path. Add R2 (or a
+# second host) here when it actually exists; see deploy/rclone-and-r2-setup.md.
 mirrors = [
-    "https://dl.proto.bar",       # R2 primary (today: still the Pi, pre-cutover)
-    "https://files.proto.bar",    # Pi failover (add the DNS record when you free up dl.)
+    "https://dl.proto.bar",
 ]
 
 # --- M3 (not yet wired) ---

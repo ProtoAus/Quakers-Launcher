@@ -5,6 +5,7 @@
 //! verify by hash -> repair. Kept UI-agnostic enough that a GUI can wrap it later;
 //! the terminal front-end lives in `main.rs`.
 
+pub mod confirm;
 pub mod config;
 pub mod download;
 pub mod hashing;

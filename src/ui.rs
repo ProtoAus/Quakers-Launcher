@@ -695,7 +695,7 @@ pub fn preview() -> String {
     let header = Header {
         system: system_description(),
         platform: crate::manifest::platform_key().to_string(),
-        release: "beta · 2026.07.27_1".to_string(),
+        release: "alpha · 2026.07.27_1".to_string(),
         mirror: "dl.proto.bar".to_string(),
     };
     let p = Progress::new(total, 13786, 4, cats, header);

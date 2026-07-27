@@ -426,7 +426,9 @@ def main():
     ap.add_argument("--install-root", default=r"C:\FTEQuake")
     ap.add_argument("--gamedir", default=r"C:\FTEQuake\quakers")
     ap.add_argument("--out", default=r"C:\FTEQuake\launcher\dist")
-    ap.add_argument("--channel", default="beta")
+    # Player-facing: the launcher header prints this verbatim ("Release alpha - <version>").
+    # Keep in step with the --channel default in launcher/src/main.rs.
+    ap.add_argument("--channel", default="alpha")
     ap.add_argument("--version", default=None, help="build id (default: UTC timestamp)")
     ap.add_argument("--launcher-version", default="0.1.0")
     ap.add_argument("--mirrors", nargs="*", default=["https://dl.proto.bar"])
