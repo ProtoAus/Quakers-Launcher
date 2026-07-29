@@ -308,6 +308,14 @@ async fn run(args: Args) -> Result<()> {
         println!("  {}", "✓ Everything is up to date.".green().bold());
     }
 
+    // ---- delete anything the manifest retired ----
+    // Only after a clean sync: pruning while downloads are failing could leave the install
+    // missing both the old file and its replacement.
+    let pruned = prune_removed(&manifest, &install_dir);
+    if pruned > 0 {
+        println!("  {}", format!("✓ Removed {pruned} obsolete file(s).").green());
+    }
+
     // ---- record state (downloaded files verified; trusted files assumed good) ----
     let mut new_state = state::State {
         version: manifest.version.clone(),
@@ -315,6 +323,11 @@ async fn run(args: Args) -> Result<()> {
     };
     for e in manifest.files_for_platform() {
         new_state.files.insert(e.path.clone(), e.hash.clone());
+    }
+    // Drop retired paths from the ledger too, or every future run would think they are still
+    // installed and the entry would outlive the file.
+    for p in &manifest.removed {
+        new_state.files.remove(p);
     }
     if let Err(e) = state::save(&install_dir, &new_state) {
         eprintln!("warning: could not write install state: {e}");
@@ -329,6 +342,46 @@ async fn run(args: Args) -> Result<()> {
         launch_game(&install_dir, &exec.cmd, &exec.args)?;
     }
     Ok(())
+}
+
+/// Delete the manifest's retired paths, plus any directories they empty out.
+///
+/// `path` here is attacker-influenced JSON, so it is validated rather than trusted: relative
+/// only, forward slashes only, no `..`, no drive letters. A rejected entry is skipped silently —
+/// a malformed manifest must not be able to reach outside the install root, and must not be able
+/// to abort an otherwise successful install either.
+fn prune_removed(manifest: &manifest::Manifest, install_dir: &Path) -> usize {
+    let mut n = 0;
+    for rel in &manifest.removed {
+        if !is_safe_relpath(rel) {
+            eprintln!("warning: ignoring unsafe \"removed\" entry: {rel}");
+            continue;
+        }
+        let p = install_dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if p.is_file() && std::fs::remove_file(&p).is_ok() {
+            n += 1;
+            // Tidy up directories the deletion emptied, but never climb out of install_dir.
+            let mut dir = p.parent().map(|d| d.to_path_buf());
+            while let Some(d) = dir {
+                if d == install_dir || !d.starts_with(install_dir) {
+                    break;
+                }
+                if std::fs::remove_dir(&d).is_err() {
+                    break; // not empty, or in use — fine, stop climbing
+                }
+                dir = d.parent().map(|x| x.to_path_buf());
+            }
+        }
+    }
+    n
+}
+
+fn is_safe_relpath(p: &str) -> bool {
+    !p.is_empty()
+        && !p.starts_with('/')
+        && !p.contains('\\')
+        && !p.contains(':')
+        && p.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
 fn launch_game(install_dir: &Path, cmd: &str, args: &[String]) -> Result<()> {
@@ -415,8 +468,33 @@ fn container_reason(dir: &Path) -> Option<String> {
     container_reason_in(dir, home.as_deref())
 }
 
+/// Resolve a relative install dir against the current directory.
+///
+/// The guard below reasons about path *shape* — component count, basename, whether there is a
+/// parent — and none of that means anything for a relative path. `Path::new(".")` has exactly
+/// one component, so an unresolved "." reads as a drive root and gets redirected into
+/// `./Quakers`. That is not hypothetical: `install_dir = "."` is what every launcher.toml
+/// shipped before 0.1.6 says, and until 0.1.5 the key was silently ignored, so the guard had
+/// only ever been handed absolute paths.
+fn absolutise(p: PathBuf) -> PathBuf {
+    let abs = if p.is_absolute() {
+        p
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(&p),
+            Err(_) => p,
+        }
+    };
+    // Re-collecting through Components drops interior/trailing "." segments, so joining an
+    // absolute cwd with "." gives "C:/games/quakers" rather than "C:/games/quakers/." — which
+    // would otherwise show up in the banner and in every path we print.
+    let cleaned: PathBuf = abs.components().collect();
+    if cleaned.as_os_str().is_empty() { abs } else { cleaned }
+}
+
 /// Apply the guard: if `requested` is a container folder, install into a subfolder of it.
 fn resolve_install_dir(requested: PathBuf, allow_unsafe: bool) -> (PathBuf, Option<String>) {
+    let requested = absolutise(requested);
     if allow_unsafe {
         return (requested, None);
     }
@@ -554,6 +632,69 @@ mod tests {
             assert!(
                 container_reason_in(&p(g), Some(&h)).is_none(),
                 "should have been accepted: {g}"
+            );
+        }
+    }
+
+    /// `install_dir = "."` is what every launcher.toml shipped before 0.1.6 contains, so an
+    /// existing tester who drops a new exe next to their old toml goes down this path. It must
+    /// mean "install right here", not "you are at a drive root, have a subfolder" -- the latter
+    /// silently re-downloads 6.3 GB into <install>/Quakers.
+    #[test]
+    fn relative_install_dir_is_resolved_before_the_guard() {
+        let cwd = std::env::current_dir().unwrap();
+        for rel in [".", "./"] {
+            let (dir, why) = resolve_install_dir(PathBuf::from(rel), false);
+            assert!(why.is_none(), "{rel} should not be flagged as a container: {why:?}");
+            assert!(dir.is_absolute(), "{rel} should resolve to an absolute path, got {dir:?}");
+            assert!(
+                !dir.ends_with(INSTALL_FOLDER_NAME) || cwd.ends_with(INSTALL_FOLDER_NAME),
+                "{rel} was redirected into a subfolder: {dir:?}"
+            );
+            assert_eq!(dir, cwd, "{rel} should resolve to exactly the current directory");
+            assert!(
+                !dir.to_string_lossy().contains("/.") && !dir.to_string_lossy().contains("\\."),
+                "resolved path kept a \".\" segment: {dir:?}"
+            );
+        }
+    }
+
+    /// ...but resolving must not defeat the guard: a relative path that lands somewhere silly
+    /// still has to be caught.
+    /// `removed` comes from JSON, so it is an untrusted path list pointed at the user's disk.
+    #[test]
+    fn removed_paths_are_validated() {
+        for good in [
+            "quakers/data/default.cfg",
+            "quakers/default.cfg",
+            "a",
+            "a/b/c.txt",
+        ] {
+            assert!(is_safe_relpath(good), "should be accepted: {good}");
+        }
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../outside.txt",
+            "quakers/../../outside.txt",
+            "quakers/./x",
+            "C:/Windows/system32/x.dll",
+            r"quakers\data\x.cfg",
+            "quakers//x",
+            "quakers/",
+        ] {
+            assert!(!is_safe_relpath(bad), "should be rejected: {bad}");
+        }
+    }
+
+    #[test]
+    fn relative_paths_are_still_guarded_after_resolution() {
+        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+        if let Some(h) = home {
+            let h = PathBuf::from(h);
+            assert!(
+                container_reason_in(&h.join("Desktop"), Some(&h)).is_some(),
+                "an absolutised Desktop must still be rejected"
             );
         }
     }

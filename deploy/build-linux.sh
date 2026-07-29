@@ -69,9 +69,12 @@ rsync -a --delete \
 cd "$FTE/engine"
 # a CRLF Makefile checked out on Windows breaks GNU make
 file Makefile | grep -q CRLF && sed -i 's/\r$//' Makefile
-# the openxr plugin rule cds into this dir; create it even though we don't build openxr
-mkdir -p "$FTE/engine/libs-x86_64-linux-gnu"
 
+# NOTE: libs-x86_64-linux-gnu/ must NOT exist yet. ARCHLIBS (Makefile:701) is that DIRECTORY,
+# and `ifneq ("$(wildcard $(ARCHLIBS))","")` (Makefile:1054) is true for an existing *empty*
+# directory -- so merely creating it makes the Makefile believe `make makelibs` was run. It then
+# sets FREETYPE_CFLAGS/PNG/JPEG to nothing instead of asking pkg-config, and the build dies on
+# `ft2build.h: No such file or directory`. We link those from the system, so leave it absent.
 make gl-rel FTE_TARGET=linux64 -j"$JOBS"
 make sv-rel FTE_TARGET=linux64 -j"$JOBS"
 
@@ -80,6 +83,9 @@ say "FTE plugins (box3d, hl2, cod)"
 # drags in openxr/ffmpeg and is not worth the build surface.
 # ODE is deliberately NOT built: box3d is the default backend and the only one the mod
 # ships. `sv_physics_engine ode` therefore has no effect on Linux.
+# Only now create the dir -- the openxr plugin rule cds into it, and none of these three
+# plugins includes a freetype/png/jpeg header, so the ARCHLIBS misdetection is harmless here.
+mkdir -p "$FTE/engine/libs-x86_64-linux-gnu"
 make plugins-rel FTE_TARGET=linux64 \
      NATIVE_PLUGINS="box3d hl2 cod" \
      BOX3D_BASE="$BOX3D" \

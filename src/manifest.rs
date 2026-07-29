@@ -60,6 +60,11 @@ pub struct Manifest {
     pub total_files: u64,
     #[serde(default)]
     pub total_bytes: u64,
+    /// Install-relative paths to DELETE. Nothing else prunes — the launcher and the in-game
+    /// updater only ever add or overwrite — so a file dropped from the manifest would otherwise
+    /// linger forever. Absent in older manifests; deleting a missing file is a no-op.
+    #[serde(default)]
+    pub removed: Vec<String>,
     pub files: Vec<FileEntry>,
 }
 

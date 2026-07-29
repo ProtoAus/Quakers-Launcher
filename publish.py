@@ -35,6 +35,7 @@ import json
 import os
 import re
 import struct
+import sys
 import time
 import zipfile
 
@@ -72,10 +73,16 @@ def hash_file(path):
 # Rules are intentionally conservative: we EXCLUDE dev/source/backup and everything
 # else ships. Audit included.txt / excluded.txt after every run.
 
+# Directory names that are only dev scratch AT THE GAMEDIR ROOT. They must NOT be matched deeper:
+# "tools" was in the any-depth set below until 2026-07-28, which silently dropped
+# models/props/tools/ -- 336 files of real prop art, including 11 props 2fort places -- from
+# every release. The models resolved fine locally, so it only showed up as missing models in game.
+SKIP_DIRS_ROOT = {"tools", "launcher"}
+
 # gamedir-relative directory names skipped anywhere in the tree
 SKIP_DIRS = {
-    "src", "tools", "_prerender_backup", "screenshots", "dlcache",
-    "_staging", ".git", "__pycache__", ".vs", "launcher",
+    "src", "_prerender_backup", "screenshots", "dlcache",
+    "_staging", ".git", "__pycache__", ".vs",
     # textures/disable/ holds ~455 *_norm.png maps that were switched off by being moved
     # here: FTE resolves a normal map as textures/<name>_norm, so nothing under a
     # disable/ subdir is reachable by any material. Shipping them is 141 MB of dead weight.
@@ -89,6 +96,10 @@ SKIP_EXT = {
     ".pfx", ".bak", ".tmp", ".orig",                      # secrets / scratch
     ".blend", ".blend1", ".psd", ".xcf", ".ztl",          # editor sources
     ".py", ".pyc", ".ps1", ".sh",                         # tooling (belt-and-suspenders)
+    # External coloured-lighting files. Every shipped map has its lighting baked into the .bsp,
+    # so these are ~32 MB of duplicate lightmap data the engine loads over identical baked data.
+    # If a future map genuinely needs an external .lit, drop this and skip per-map instead.
+    ".lit",
 }
 
 # OS/file-manager droppings that get created invisibly and are pure noise in a game install
@@ -109,20 +120,177 @@ SKIP_ROOT_FILES = {
 # exact-name list never keeps up.
 SKIP_ROOT_PREFIXES = ("conhistory", "qconsole")
 
+# Directory names skipped wherever they appear in the path. maps/_loosepack_bsp_backup/ held
+# five older copies of shipped .bsp files and was publishing all of them.
+SKIP_DIR_NAMES = {"_loosepack_bsp_backup"}
+
+# Map basenames we are allowed to ship, loaded from the gamedir's cfg/maps.txt -- the SAME file
+# m_main.qc reads to pick the backdrop map and m_createserver.qc reads for its map pool. Deriving
+# it rather than hardcoding a list here means editing that one file changes both what the game
+# offers and what the release contains, so they cannot drift apart.
+MAPS_ALLOWED = set()
+
+
+def load_maps_allowlist(gamedir):
+    """Read cfg/maps.txt into MAPS_ALLOWED. Refuses to publish if it is missing or empty.
+
+    Failing open (shipping every map) would silently undo the restriction and put ~560 MB of
+    dev maps back in the release; failing closed without saying so would ship a game with no
+    maps at all. Both are worse than stopping.
+    """
+    p = os.path.join(gamedir, "cfg", "maps.txt")
+    if not os.path.isfile(p):
+        raise SystemExit(f"REFUSING TO PUBLISH: {p} not found -- it decides which maps ship.")
+    with open(p, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("//"):
+                MAPS_ALLOWED.add(os.path.splitext(line)[0].lower())
+    if not MAPS_ALLOWED:
+        raise SystemExit(f"REFUSING TO PUBLISH: {p} lists no maps.")
+    return MAPS_ALLOWED
+
+
+# Durable record of every path any past release has retired. Kept OUTSIDE the manifest because
+# the manifest is rewritten by every publish: building twice without pushing (or discarding a
+# build) would otherwise erase the history and quietly stop telling testers to delete anything.
+RETIRED_STORE = "retired.json"
+
+
+def load_retired(out_dir):
+    try:
+        with open(os.path.join(out_dir, RETIRED_STORE), "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def save_retired(out_dir, paths):
+    os.makedirs(out_dir, exist_ok=True)
+    p = os.path.join(out_dir, RETIRED_STORE)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(sorted(paths), f, indent=1)
+    os.replace(tmp, p)
+
+
+def prune_dirs(dirpath, dirnames, gamedir):
+    """In-place os.walk pruning: drop scratch dirs, root-only names only at the root."""
+    at_root = os.path.normpath(dirpath) == os.path.normpath(gamedir)
+    dirnames[:] = [d for d in dirnames
+                   if d not in SKIP_DIRS and not (at_root and d in SKIP_DIRS_ROOT)]
+
+
+def derive_removed(prev_path, new_paths, platforms):
+    """Everything an installed copy must delete, CUMULATIVELY. Returns (all, newly_dropped).
+
+    Hand-maintaining this is the thing that rots. Every repack that folds loose files into a pk3,
+    every renamed directory, every trimmed map drops dozens of paths at once, and anything missed
+    sits on every tester's disk forever. Diffing the previous manifest catches all of it for free.
+
+    It MUST accumulate, not just diff. A tester can be several releases behind, and if release N+1
+    only lists what release N dropped, someone updating from N-1 straight to N+1 never hears about
+    N's retirements and keeps them forever. So carry the previous manifest's `removed` forward and
+    add this run's drops to it.
+
+    Two guards:
+      * anything present in the new manifest is subtracted, so a path that is retired and later
+        re-added does not get deleted right after being downloaded.
+      * a file is only newly retired if its platform is one we actually built this run. Without
+        that, `--platforms win64` would drop every linux64 entry from the manifest and the diff
+        would cheerfully tell Linux testers to delete their engine.
+    """
+    try:
+        with open(prev_path, "r", encoding="utf-8") as f:
+            prev = json.load(f)
+    except Exception:
+        return set(), []
+    want = set(platforms) | {"all"}
+    dropped = [e["path"] for e in prev.get("files", [])
+               if e.get("path") and e["path"] not in new_paths
+               and e.get("platform", "all") in want]
+    carried = set(prev.get("removed", []))
+    return (carried | set(dropped)) - new_paths, sorted(dropped)
+
+
+def map_stem(relslash):
+    """Map name a file under maps/ belongs to.
+
+    Split at the FIRST dot, not the last: companions stack suffixes on the full map name
+    (notnormals.bsp.json, notnormals_shadowtest.bsp.lm_0.png, 2fort.lit, notnormals.pts).
+    Map names contain no dots, so the first-dot split recovers the map for every one of them.
+    """
+    return os.path.basename(relslash).split(".", 1)[0].lower()
+
 # Gamedir-relative paths (forward slashes, lowercase) that are per-machine RUNTIME STATE, not
 # content. These live in subdirectories, so SKIP_ROOT_FILES -- which only matches at the gamedir
 # root -- never sees them, and they quietly shipped for months. Each is rewritten by simply
 # playing the game, so every publish pushed one machine's state to every tester.
+#
+# These paths moved from data/ to cfg/ on 2026-07-28. If you ever rename that directory again,
+# CHANGE THEM HERE IN THE SAME COMMIT: this list is matched on the exact relative path, so a
+# stale entry does not error -- it silently stops skipping, and the next publish pushes one
+# machine's keybinds and map cache to every tester. That is the quietest failure in this script,
+# which is why the summary asserts the expected number of runtime-state skips actually fired.
 SKIP_RELPATHS = {
     # What the settings menu writes when you hit save: keybinds, sensitivity, and the
     # resolution/audio-device choices, which suit exactly one machine.
-    "data/settings.cfg",
+    "cfg/settings.cfg",
     # Engine-generated map cache. Regenerated on demand, and it changes whenever the local
     # map set does -- so it is noise in the manifest and wrong for anyone else.
-    "data/maps_index.txt",
+    "cfg/maps_index.txt",
+    # `sv_writecvars` dumps every cvar here as a reference. Regenerated on demand, never exec'd
+    # by anything, and 25 KB of pure noise in the manifest.
+    "cfg/allcommands.cfg",
     # Local stats database. Pure runtime state; shipping it hands every tester our numbers.
     "sqlite/quakers_stats.d",
+    # Same, under the mod's former name. sv_progression.qc does sqlconnect(..."quakers_stats"...),
+    # so nothing has written this since the rename -- it is a stale local DB that we were
+    # nevertheless publishing to everyone.
+    "sqlite/nettest_stats.d",
 }
+
+# Paths to DELETE from an existing install, emitted as the manifest's top-level "removed" array.
+#
+# Nothing else prunes: both the launcher and the in-game updater only ever add or overwrite, so a
+# file that leaves the manifest lingers on every tester's disk forever. Without this the cfg/
+# move would leave a stale data/ folder holding a second, older copy of every config -- exactly
+# the split this change exists to end.
+#
+# Safe to leave entries here indefinitely: deleting an already-absent file is a no-op. Both
+# consumers path-validate before unlinking, so nothing here can escape the install root.
+REMOVED_PATHS = [
+    # the data/ -> cfg/ move (2026-07-28)
+    "quakers/data/default.cfg",
+    "quakers/data/server.cfg",
+    "quakers/data/ftesrv.cfg",
+    "quakers/data/allcommands.cfg",
+    "quakers/data/engine_tweaks.cfg",
+    "quakers/data/maps.txt",
+    "quakers/data/settings.cfg",
+    "quakers/data/maps_index.txt",
+    "quakers/data/scripts/sprays.shader",
+    # boot configs that now live in cfg/ -- if these survive, the engine still prefers cfg/ but
+    # the duplicate copies are precisely the confusion being removed.
+    "quakers/default.cfg",
+    "quakers/server.cfg",
+    "quakers/ftesrv.cfg",
+    "quakers/backupcommands.cfg",
+    # runtime state that shipped by accident before SKIP_RELPATHS existed, and is therefore
+    # still sitting in every install made before 2026-07-27.
+    "quakers/sqlite/quakers_stats.d",
+    "quakers/sqlite/nettest_stats.d",
+    # cubemap/ -> gfx/cubemap/ (2026-07-28). The flashlight cookie's only consumer is
+    # FLASHLIGHT_COOKIE_SHADER in cl_flashlight.qc, moved to match in the same change.
+    "quakers/cubemap/flashlight.png",
+    "quakers/cubemap/flashlight_nx.tga",
+    "quakers/cubemap/flashlight_ny.tga",
+    "quakers/cubemap/flashlight_nz.tga",
+    "quakers/cubemap/flashlight_px.tga",
+    "quakers/cubemap/flashlight_px_fullres.tga",
+    "quakers/cubemap/flashlight_py.tga",
+    "quakers/cubemap/flashlight_pz.tga",
+]
 
 # Engine binaries (component = "engine"). Entries are (filename, source-subdir-of-install-root,
 # needs-exec-bit). The ~6.3 GB of game content is identical on every platform and is tagged
@@ -136,16 +304,23 @@ SHARED_ENGINE_FILES = [
 ]
 
 PLATFORM_ENGINE_FILES = {
+    # ODE is deliberately NOT shipped. Box3D is the physics backend for every prop, ragdoll
+    # and vehicle (sv_physics_engine defaults to box3d and quakers/default.cfg plug_loads only
+    # box3d at boot), so the ODE plugin was dead weight in the payload. `sv_physics_engine ode`
+    # therefore only works on a dev machine that still has fteplug_ode_* beside the exe --
+    # see the guard comment in server/sv_main.qc.
     "win64": [
         ("fteqw64.exe", ".", True),
         ("sqlite3.dll", ".", False),
-        ("fteplug_ode_x64.dll", ".", False),
         ("fteplug_box3d_x64.dll", ".", False),
         ("fteplug_hl2_x64.dll", ".", False),
         ("fteplug_cod_x64.dll", ".", False),
     ],
     # quakers/default.cfg does `plug_load box3d / hl2 / cod`, so those three .so files are
-    # not optional — box3d is the physics backend behind every prop and ragdoll.
+    # not optional -- box3d is the physics backend behind every prop and ragdoll. If you drop
+    # hl2 or cod from a platform here, flip the matching fs_have_* flag in quakers/cfg/default.cfg
+    # (and ftesrv.cfg) to 0 so the Create Server menu stops indexing and mounting maps that the
+    # engine can no longer parse.
     # No sqlite3 shim: FTE dlopen()s the system libsqlite3.so.0 on Linux.
     "linux64": [
         ("fteqw-gl64", "_engine/linux64", True),
@@ -259,7 +434,7 @@ def map_referenced_textures(gamedir):
     # model skins / material scripts / cfgs naming textures directly
     TEXTREF_EXT = {".skin", ".shader", ".mat", ".txt", ".cfg", ".particles", ".framegroups"}
     for dirpath, dirnames, filenames in os.walk(gamedir):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        prune_dirs(dirpath, dirnames, gamedir)
         for fn in filenames:
             if os.path.splitext(fn)[1].lower() not in TEXTREF_EXT:
                 continue
@@ -296,6 +471,12 @@ def skip_reason(rel, name, ext, pk3_tex=frozenset(), used_tex=None):
         return "os-junk"
     if ext in SKIP_EXT:
         return "ext"
+    if SKIP_DIR_NAMES.intersection(c.lower() for c in relslash.split("/")[:-1]):
+        return "backup-dir"
+    # Maps not listed in cfg/maps.txt, and their companions (.lit/.bsp.json/.pts/...). Checked
+    # before the generic image rules below so a stray map .png goes in this bucket, not another.
+    if top == "maps" and MAPS_ALLOWED and map_stem(relslash) not in MAPS_ALLOWED:
+        return "map-not-listed"
     if "/" not in relslash and low in SKIP_ROOT_FILES:
         return "root-junk"
     if "/" not in relslash and low.startswith(SKIP_ROOT_PREFIXES):
@@ -358,7 +539,7 @@ def collect(install_root, gamedir, gamedir_name, platforms, used_tex=None):
 
     # gamedir tree -> manifest path is "<gamedir_name>/<rel>"
     for dirpath, dirnames, filenames in os.walk(gamedir):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        prune_dirs(dirpath, dirnames, gamedir)
         for fn in filenames:
             ap = os.path.join(dirpath, fn)
             rel = os.path.relpath(ap, gamedir)
@@ -461,7 +642,7 @@ def main():
     ap.add_argument("--version", default=None, help="build id (default: UTC timestamp)")
     # Keep in step with `version` in Cargo.toml -- this is what a future self-update check
     # would compare against, so a stale value here would tell every client it is current.
-    ap.add_argument("--launcher-version", default="0.1.5")
+    ap.add_argument("--launcher-version", default="0.1.6")
     ap.add_argument("--mirrors", nargs="*", default=["https://dl.proto.bar"])
     ap.add_argument("--objects", dest="objects", action="store_true", default=True,
                     help="build the content-addressed objects/ tree (default)")
@@ -502,6 +683,8 @@ def main():
     platforms = list(dict.fromkeys(args.platforms))
     gamedir_name = os.path.basename(os.path.normpath(args.gamedir))
     version = args.version or utcnow().strftime("%Y.%m.%d_%H%M")
+
+    load_maps_allowlist(args.gamedir)
 
     # Object names ARE content hashes, so changing the algorithm renames every blob: a full
     # re-upload of the whole payload and a full re-download for every tester. That is far too
@@ -564,6 +747,20 @@ def main():
         c, b = by_top[k]
         print(f"        {k:<14} {c:>6} files  {human(b)}")
     print(f"SKIP  : {len(skipped):>6} files  {human(skip_bytes)}   ({dict(sorted(skip_by_reason.items()))})")
+
+    # A stale SKIP_RELPATHS entry does not error -- it just stops matching, and one machine's
+    # keybinds and map cache quietly ship to every tester. So check the files it names either
+    # got skipped or genuinely are not on disk, and shout if one is present-but-unskipped.
+    skipped_rels = {rel.replace(os.sep, "/").lower() for rel, _ in skipped}
+    leaked = [
+        p for p in sorted(SKIP_RELPATHS)
+        if p not in skipped_rels and os.path.exists(os.path.join(args.gamedir, p.replace("/", os.sep)))
+    ]
+    if leaked:
+        print("\n*** RUNTIME STATE IS ABOUT TO BE PUBLISHED ***")
+        for p in leaked:
+            print(f"      {p}  exists but was not skipped -- SKIP_RELPATHS is stale")
+        sys.exit("refusing to publish per-machine state")
     for k in sorted(by_platform):
         c, b = by_platform[k]
         label = "shared by all platforms" if k == "all" else f"{k}-only"
@@ -689,6 +886,17 @@ def main():
             e["exec"] = True
         files.append(e)
 
+    # Explicit retirements (things that were never manifest entries -- runtime state that
+    # shipped before SKIP_RELPATHS existed) plus everything the previous manifest carried and
+    # this one drops.
+    new_paths = {e["path"] for e in files}
+    cumulative, newly = derive_removed(prev_path, new_paths, platforms)
+    removed_paths = sorted(
+        (set(REMOVED_PATHS) | load_retired(args.out) | cumulative) - new_paths)
+    save_retired(args.out, removed_paths)
+    print(f"removed[]    : {len(removed_paths)} paths "
+          f"({len(newly)} newly dropped this run, rest carried forward)")
+
     manifest = {
         "schema": 2,
         "channel": args.channel,
@@ -705,6 +913,9 @@ def main():
         "platforms": platforms,
         "total_files": len(files),
         "total_bytes": total_bytes,
+        # Consumers that predate this key ignore it (no deny_unknown_fields anywhere in the
+        # launcher's manifest structs), so it needs no schema bump.
+        "removed": removed_paths,
         "files": files,
     }
     man_dir = os.path.join(args.out, "manifests")
