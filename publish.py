@@ -342,6 +342,30 @@ EXEC_BY_PLATFORM = {
 IMG_EXT = {".png", ".dds", ".tga", ".jpg", ".jpeg", ".ktx", ".vtf", ".bmp", ".lmp", ".pcx"}
 
 
+def is_build_output(mpath):
+    """Files a build REGENERATES IN PLACE, which must never be hardlinked into objects/.
+
+    Hardlinking is only safe when the source is immutable after publishing.  These are
+    not: fteqcc opens qwprogs.dat / csprogs.dat / menu.dat and truncates, and
+    pack_csprogs.py rewrites the pk3 -- and because a hardlink is the same inode, that
+    write lands *inside the published blob*.  The object keeps its old name (a hash of
+    the OLD bytes) while holding the new content, so it no longer hashes to its own name.
+
+    Silent until it matters, and then it matters a lot: r2-push uses `rclone copy`, which
+    compares size/mtime, so a corrupted local object would happily overwrite the still-
+    correct blob on R2 -- handing every client on the old manifest a progs that fails
+    verification.  Caught exactly this on 2026-07-29 with qwprogs.dat and menu.dat, both
+    live-referenced by alpha.json.
+
+    Copying costs a few MB per publish; the ~5 GB of textures and models are never
+    rewritten in place and keep their hardlinks.
+    """
+    base = os.path.basename(mpath).lower()
+    if base in ("qwprogs.dat", "csprogs.dat", "menu.dat", "quakers_csprogs.pk3"):
+        return True
+    return base.endswith(".lno")
+
+
 def _stem_forms(relslash):
     """Extensionless path forms to match a texture on, with/without a leading textures/."""
     base = os.path.splitext(relslash.lower())[0]
@@ -842,7 +866,7 @@ def main():
                 continue
             os.makedirs(odir, exist_ok=True)
             try:
-                if args.link == "hardlink":
+                if args.link == "hardlink" and not is_build_output(mpath):
                     os.link(ap_, opath)
                 else:
                     import shutil
