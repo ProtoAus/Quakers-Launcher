@@ -159,7 +159,77 @@ Object names *are* content hashes, so changing `hash_algo` renames **every** blo
 The speedup is meaningless here (a publish is ~15 s cold and ~1 s warm off the mtime cache) and
 BLAKE2b-256 is in the Python stdlib, so any machine can publish with no dependencies.
 
-## Next
+## FTESurf bootstrap (separate from the Quakers profile)
+
+`cargo build --locked --release --bin ftesurf-launcher` builds the small FTESurf
+entry point. Put `ftesurf-launcher.exe` (Windows) or `ftesurf-launcher` (Linux)
+beside the engine and `default.fmf`, not inside the gamedir. It uses its own
+executable's folder as the install root, starts the real engine in that folder,
+and waits for the game to exit. Engine arguments follow `--` unchanged:
+
+```
+ftesurf-launcher.exe -- -window +map surf_example
+ftesurf-launcher.exe --offline
+ftesurf-launcher.exe --enable-updates
+```
+
+The first interactive launch asks permission. `--yes` enables permission for
+an installer; a stored opt-out launches without a launcher feed request.
+`--offline` skips the launcher check for one launch without changing permission
+(the game's own native updater still reads the stored permission). The game's
+Updates pane provides persistent opt-out. `--wait-for-game` is the native
+restart handoff, not a general process killer. All recovery precedes launch;
+failed signatures, rollback, partial repair and unsafe paths refuse to start a
+mixed installation. A network outage may fall back only to a complete cached,
+signed install; explicit `--offline` also permits an existing archive install.
+
+On Linux, a hash match is not sufficient for launch readiness: a signed executable
+can have lost its execute bit during extraction or interrupted recovery. The
+bootstrap verifies the complete signed file set before repairing permissions,
+including byte-correct archive adoption, cold recovery after rename, and signed
+cached-outage fallback. Existing read/write access is preserved; execute is added
+for the owner and existing readers only. Player-edited zones and custom mounts
+are never chmod targets. Explicit unsigned `--offline` does not repair permissions.
+`--dry-run` never performs that repair or commits recovery; an unfinished launcher
+transaction refuses with guidance to rerun `--verify` without `--dry-run`.
+
+Developer controls in FTESurf's `tools/test_update_launcher.py` support both
+Windows and Linux (`--seed-file` supplies the private signing seed file).
+`tools/test_update_posix.py` exercises real fixture launches, lost execute bits,
+recovery, cached outage, dry-run and protected/link rejection. Its small runtime
+fixtures use a bounded POSIX temporary directory, not a copied game install.
+These synthetic controls do not prove the native Linux game's restart handoff,
+release-archive integration, or minimum supported glibc compatibility.
+
+**Bootstrap upgrade policy:** this executable is separately delivered by official
+archives and is excluded from the signed ordinary update manifest. Exit BOTH
+game and launcher before upgrading the bootstrap from a checksum-verified newer
+archive. Never try to overwrite the running bootstrap. No automatic bootstrap
+self-update or code signing is implemented. `ftesurf.bat` / `ftesurf.sh` start
+this bootstrap when present and forward engine options after `--`; only a missing
+bootstrap takes the direct-engine fallback. A bootstrap refusal never falls back
+to the engine. Linux also refuses linked/non-executable bootstrap paths, including
+dangling links. `./ftesurf.sh --debug` retains console/stderr logging.
+On a first wrapper launch with neither saved consent nor terminal input, the
+wrapper explicitly sends `--offline`: it starts the installed game without a
+bootstrap check and leaves permission unset for in-game opt-in. A first terminal
+launch retains the bootstrap's permission prompt. Subsequent wrapper launches
+follow saved permission. Windows uses the built-in Windows PowerShell console
+probe only while consent is absent; a failed probe conservatively selects offline.
+`--offline` skips only the bootstrap's check; the native game's independent
+auto-check still follows saved permission (opt out in the Updates pane to disable
+both checks).
+
+FTESurf's release script requires `-LauncherRoot <inspected source checkout>`
+(or `FTESURF_LAUNCHERROOT`), rebuilds the bootstrap with locked dependencies,
+checks dirty source, and records commit, complete source fingerprint, Rust
+compiler/target and binary hash. Archives require the bootstrap and its full
+license/dependency notice file `notices/bootstrap.txt`. Linux builds additionally
+measure the bootstrap's dependencies/glibc floor; Windows verification does not
+prove Linux runtime behavior. The synthetic loopback fixtures and native
+handoff adapter are never distribution files or production-feed evidence.
+
+## Next (Quakers)
 
 1. Create the R2 bucket + custom domain and push (`deploy/rclone-and-r2-setup.md`), then validate
    with `curl`.

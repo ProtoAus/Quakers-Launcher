@@ -5,9 +5,10 @@
 //! verify by hash -> repair. Kept UI-agnostic enough that a GUI can wrap it later;
 //! the terminal front-end lives in `main.rs`.
 
-pub mod confirm;
 pub mod config;
+pub mod confirm;
 pub mod download;
+pub mod ftesurf_update;
 pub mod hashing;
 pub mod manifest;
 pub mod plan;
