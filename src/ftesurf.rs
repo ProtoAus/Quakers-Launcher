@@ -1,14 +1,9 @@
 //! World of Surf presentation for the signed FTESurf bootstrap: check, update, launch.
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use fs2::FileExt;
-use quakers_launcher::{download, ftesurf_update as u, ftesurf_ui as ui};
-use std::{
-    fs,
-    io,
-    path::PathBuf,
-    time::Duration,
-};
+use quakers_launcher::{download, ftesurf_ui as ui, ftesurf_update as u};
+use std::{fs, io, path::PathBuf, time::Duration};
 
 #[derive(Parser)]
 #[command(
@@ -16,10 +11,10 @@ use std::{
     about = "World of Surf Launcher. Update, verify, then play. Settings and mounted games are never updated."
 )]
 struct Args {
-    /// Render sample artwork/progress only; no network, install writes or game launch.
+    /// Render sample logo/progress only; no network, install writes or game launch.
     #[arg(long)]
     ui_preview: bool,
-    /// Animate the logo/artwork with sample data only; Enter or Esc closes the preview.
+    /// Animate the centered logo with sample data only; Enter or Esc closes the preview.
     #[arg(long, conflicts_with = "ui_preview")]
     ui_demo: bool,
     #[arg(long)]
@@ -140,6 +135,12 @@ async fn run(a: &Args) -> Result<()> {
             }
         }
     }
+    // A source checkout must never be repaired back to the public release.
+    let development = root.join(".git").try_exists()?;
+    ensure!(
+        !development || !u::checked_path(&root, ".ftesurf-updater/pending.json")?.exists(),
+        "unfinished release update in a development checkout; resolve it before launching (no files were promoted)"
+    );
     // Recovery precedes ALL launch paths, but a dry run must not commit a transaction.
     ensure!(
         !a.dry_run || !u::checked_path(&root, ".ftesurf-updater/pending.json")?.exists(),
@@ -149,7 +150,10 @@ async fn run(a: &Args) -> Result<()> {
     let ingame_journal = u::checked_path(&root, ".ftesurf-updater/ingame/journal.json")?;
     let ingame_pending = ingame_journal.exists();
     let consent = u::checked_path(&root, ".ftesurf-updater/consent")?;
-    let enabled = if a.yes || a.enable_updates {
+    let enabled = if development {
+        println!("Development checkout: public release updates skipped; keeping your dev build.");
+        false
+    } else if a.yes || a.enable_updates {
         if !a.dry_run {
             u::write_meta(&root, "consent", b"1\n")?;
         }
@@ -205,8 +209,15 @@ async fn run(a: &Args) -> Result<()> {
                         jobs.len(),
                         jobs.iter().map(|f| f.size).sum::<u64>() as f64 / 1048576.0
                     );
-                    if !ui::confirm(&format!("Download {} file(s) / {} to {}?", jobs.len(),
-                        ui::human(jobs.iter().map(|f| f.size).sum()), root.display()), a.yes)? {
+                    if !ui::confirm(
+                        &format!(
+                            "Download {} file(s) / {} to {}?",
+                            jobs.len(),
+                            ui::human(jobs.iter().map(|f| f.size).sum()),
+                            root.display()
+                        ),
+                        a.yes,
+                    )? {
                         println!("Download cancelled. No game was started.");
                         return Ok(());
                     }
@@ -302,13 +313,25 @@ async fn run(a: &Args) -> Result<()> {
     // The engine takes this same lock BEFORE loading plugins/progs. Drop ours before spawn;
     // if another launcher wins that small gap, the engine refuses to boot, not a mixed set.
     FileExt::unlock(&lock)?;
-    let status = std::process::Command::new(exe)
-        .args(["-manifest", "default.fmf"])
+    let mut game = std::process::Command::new(exe);
+    game.args(["-manifest", "default.fmf"])
         .args(&a.game_args)
-        .current_dir(&root)
-        .status()?;
-    if !status.success() {
-        bail!("game exited with {status}");
+        .current_dir(&root);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // The game must not keep the launcher's console window alive.
+        game.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x00000008 | 0x00000200); // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        game.spawn().context("could not start FTESurf")?;
+    }
+    #[cfg(not(windows))]
+    {
+        // Keep the untested non-Windows handoff unchanged.
+        let status = game.status()?;
+        ensure!(status.success(), "game exited with {status}");
     }
     Ok(())
 }

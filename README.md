@@ -245,7 +245,12 @@ Interactive launches use **Enter / Y** to enable first-run updates, confirm a
 planned download, and launch once the existing install-readiness checks pass.
 **Esc / N / Q / Ctrl-C** declines the displayed question. Declining first-run
 update permission stores opt-out as before; declining download or launch exits
-without starting the game. `--yes` skips these questions for automation;
+without starting the game. On Windows, once Enter starts the game, the launcher
+exits instead of waiting for it to quit. The child has no inherited launcher console
+or standard handles, so a launcher-owned terminal (including `ftesurf.bat` started
+from Explorer) closes while the game keeps running. An existing interactive
+shell is not killed. Startup/spawn errors still fail visibly; a later game crash
+is no longer reported as a launcher exit status. `--yes` skips these questions for automation;
 `--no-launch` never asks to launch. Redirected output stays plain and does not
 open the dashboard or add prompts; first-run permission still requires an
 interactive terminal or explicit `--yes` / `--offline`.
@@ -262,10 +267,22 @@ workers, and retains partial files for resuming without installing or launching.
 Smaller terminals use a compact wordmark/layout.
 No artwork downloads, extra dependencies, graphics window or GPU rendering.
 
-Safe artwork preview (sample data only, no network/install writes/game launch):
+Development installs containing a `.git` directory **or worktree `.git` file**
+keep their dev binaries: public release downloads are skipped even with saved
+consent, `--yes`, `--enable-updates`, or `--verify`. This is automatic, and does
+not change saved permission. An unfinished bootstrap/in-game update refuses to
+launch rather than promoting public release files into the source checkout.
+Ordinary archive installs without `.git` retain their signed-update behavior.
+
+Build the shipped launcher with the existing release profile (LTO, stripped,
+optimized, locked dependencies); do not deploy `target/debug` or a UI preview
+build. The measured Windows release is 3,583,488 bytes versus the previous
+13,379,584-byte development preview, with the same TLS/signature checks.
+
+Safe logo preview (sample data only, no network/install writes/game launch):
 
 ```sh
-cargo build --locked --bin ftesurf-launcher
+cargo build --release --locked --bin ftesurf-launcher
 ftesurf-launcher --ui-preview
 # Live sample animation only; Enter or Esc closes (interactive terminal required).
 ftesurf-launcher --ui-demo
@@ -279,7 +296,7 @@ The control example supports `--normal-stop`, terminal cancellation, or
 slow local fixture serving one MiB of `W` bytes. It never installs or launches a
 game; transfer mode asserts that cancellation acted after staging nonzero bytes.
 
-`--ui-preview` is plain text for easy inspection; `--ui-demo` shows live artwork
+`--ui-preview` is plain text for easy inspection; `--ui-demo` shows live logo
 animation with clearly labeled sample progress. Neither performs install, network
 or game operations. Real terminal downloads use the colored dashboard. This bootstrap is still upgraded through official archives,
 not the ordinary content feed. Windows validation does not prove Linux behavior.
