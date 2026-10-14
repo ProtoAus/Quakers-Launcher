@@ -236,16 +236,25 @@ wordmark and a cyan/violet live download dashboard. There is no supplementary
 illustration: the wave and earlier ramp/sun/stars scenes have been removed.
 The logo is centered across the full header, with its existing slow neon sheen
 also visible while awaiting Enter confirmation.
-Animation uses the existing 160 ms terminal cadence, with no GPU or extra worker.
-This is presentation only: `ftesurf-launcher`, install paths, feed URLs, signing
+One black alternate-screen session covers consent, checking, downloading,
+installation, ready-to-play and interactive errors. The 160 ms logo cadence
+needs no GPU or downloaded artwork; resizing redraws the same header and palette,
+not briefly restored plain-text screens. The full 32-cell wordmark remains at
+80×24, 60×24 and 40×20; it compacts only below 34 columns or 18 rows.
+The transport now uses four actual parallel downloads, not three cosmetic slots.
+Identity and verification policy are unchanged: `ftesurf-launcher`, install paths, feed URLs, signing
 keys and the game's name/configuration remain compatible pending the full rename.
 The Quakers entry point retains its existing UI.
 
-Interactive launches use **Enter / Y** to enable first-run updates, confirm a
-planned download, and launch once the existing install-readiness checks pass.
-**Esc / N / Q / Ctrl-C** declines the displayed question. Declining first-run
-update permission stores opt-out as before; declining download or launch exits
-without starting the game. On Windows, once Enter starts the game, the launcher
+Interactive questions are small, borderless **Yes / No** choices: **Up / Down**
+selects, **Enter** confirms the selected answer, and Y/N remain shortcuts.
+A fresh install reads **Download World of Surf?**; its first Yes both consents to
+update checks (with service/IP disclosure) and approves the first download, so
+there is no second large confirmation. First-install No exits without network
+requests or game files; it does not store a silent opt-out that prevents retrying.
+Existing installs retain their saved permission and explicit download decision.
+Download questions show only the size, never a canonical Windows `\\?\` path.
+**Esc / N / Q / Ctrl-C** declines; download/play No never starts the game. On Windows, once Enter starts the game, the launcher
 exits instead of waiting for it to quit. The child has no inherited launcher console
 or standard handles, so a launcher-owned terminal (including `ftesurf.bat` started
 from Explorer) closes while the game keeps running. An existing interactive
@@ -256,14 +265,17 @@ open the dashboard or add prompts; first-run permission still requires an
 interactive terminal or explicit `--yes` / `--offline`.
 
 The main percentage counts **successfully verified files**, not received bytes.
-Each worker has a live **staged-byte** bar; a full worker bar alone is not a hash
-verification or install-completion claim. Verified-byte content meters and
-smoothed receive speed/approximate ETA accompany it. Resumed files count when
+The slim downloader shows an exact **Downloaded this session** network-byte
+total and smoothed receive speed, the package size/verified-file count, and four
+current filenames with thin **staged-byte** meters. There are no category,
+release/mirror or dashboard panels. A full worker meter says **checking** until
+verification and never claims install completion. Network retry bytes can exceed
+the package size; cached/resumed bytes are not falsely counted as fresh traffic. Resumed files count when
 verified even if no bytes arrive from the network, and repeated/corrupt transfers
 cannot manufacture completion. Incomplete percentages are floored, so 299/300
 verified files still read 99%, never 100%. During transfers, Esc / N / Q / Ctrl-C
-cancels through normal control flow, restores the terminal, drains the downloader
-workers, and retains partial files for resuming without installing or launching.
+cancels through normal control flow, drains the downloader workers before
+restoring the terminal, and retains partial files without installing or launching.
 Smaller terminals use a compact wordmark/layout.
 No artwork downloads, extra dependencies, graphics window or GPU rendering.
 
@@ -276,8 +288,8 @@ Ordinary archive installs without `.git` retain their signed-update behavior.
 
 Build the shipped launcher with the existing release profile (LTO, stripped,
 optimized, locked dependencies); do not deploy `target/debug` or a UI preview
-build. The measured Windows release is 3,583,488 bytes versus the previous
-13,379,584-byte development preview, with the same TLS/signature checks.
+build. The measured slim Windows release is 3,596,288 bytes (about 3.6 MB) versus the
+previous 13,379,584-byte development preview, with the same TLS/signature checks.
 
 Safe logo preview (sample data only, no network/install writes/game launch):
 
@@ -288,7 +300,7 @@ ftesurf-launcher --ui-preview
 ftesurf-launcher --ui-demo
 cargo test --locked --lib -- --test-threads=1
 # Client-free native terminal control probe (no game or official feed).
-cargo build --locked --example world_of_surf_ui_probe
+cargo build --release --locked --example world_of_surf_ui_probe
 ```
 
 The control example supports `--normal-stop`, terminal cancellation, or
@@ -298,7 +310,8 @@ game; transfer mode asserts that cancellation acted after staging nonzero bytes.
 
 `--ui-preview` is plain text for easy inspection; `--ui-demo` shows live logo
 animation with clearly labeled sample progress. Neither performs install, network
-or game operations. Real terminal downloads use the colored dashboard. This bootstrap is still upgraded through official archives,
+or game operations. Real terminal downloads use the same black slim screen.
+This bootstrap is still upgraded through official archives,
 not the ordinary content feed. Windows validation does not prove Linux behavior.
 
 ## Next (Quakers)
