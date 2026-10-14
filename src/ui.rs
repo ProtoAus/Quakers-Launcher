@@ -55,6 +55,8 @@ pub struct CategorySlot {
     pub name: &'static str,
     pub total: u64,
     pub done: AtomicU64,
+    /// Bytes in successfully hash-verified files, not network traffic/retries.
+    pub verified: AtomicU64,
 }
 
 /// Static context shown above the bars. The download UI takes over the alternate
@@ -112,6 +114,7 @@ pub const CATEGORY_ORDER: [&str; 8] = [
 pub struct Progress {
     pub total_bytes: u64,
     pub done_bytes: AtomicU64,
+    pub verified_bytes: AtomicU64,
     pub files_total: usize,
     pub files_done: AtomicUsize,
     pub workers: Vec<WorkerSlot>,
@@ -130,6 +133,7 @@ impl Progress {
         Arc::new(Self {
             total_bytes,
             done_bytes: AtomicU64::new(0),
+            verified_bytes: AtomicU64::new(0),
             files_total,
             files_done: AtomicUsize::new(0),
             workers: (0..n_workers).map(|_| WorkerSlot::new()).collect(),
@@ -139,6 +143,7 @@ impl Progress {
                     name,
                     total,
                     done: AtomicU64::new(0),
+                    verified: AtomicU64::new(0),
                 })
                 .collect(),
             header,
@@ -162,6 +167,13 @@ impl Progress {
     }
     pub fn file_done(&self) {
         self.files_done.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn file_verified(&self, bytes: u64, category: Option<usize>) {
+        self.verified_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(i) = category {
+            self.categories[i].verified.fetch_add(bytes, Ordering::Relaxed);
+        }
+        self.file_done();
     }
     pub fn worker_start(&self, w: usize, name: &str, total: u64) {
         let s = &self.workers[w];
@@ -568,6 +580,21 @@ pub fn start(progress: Arc<Progress>) -> Option<(Arc<AtomicBool>, JoinHandle<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verified_progress_counts_resumed_files_without_network_bytes() {
+        let p = Progress::new(100, 2, 1, vec![("Maps", 100)], Header::default());
+        p.file_verified(60, Some(0));
+        assert_eq!(p.done_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(p.verified_bytes.load(Ordering::Relaxed), 60);
+        assert_eq!(p.categories[0].verified.load(Ordering::Relaxed), 60);
+        assert_eq!(p.files_done.load(Ordering::Relaxed), 1);
+        p.add_bytes(400); // retries are network traffic, not successful files
+        assert_eq!(p.verified_bytes.load(Ordering::Relaxed), 60);
+        p.file_verified(40, Some(0));
+        assert_eq!(p.verified_bytes.load(Ordering::Relaxed), 100);
+        assert_eq!(p.files_done.load(Ordering::Relaxed), 2);
+    }
 
     #[test]
     fn buckets_real_manifest_shapes() {

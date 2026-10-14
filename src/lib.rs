@@ -9,6 +9,7 @@ pub mod config;
 pub mod confirm;
 pub mod download;
 pub mod ftesurf_update;
+pub mod ftesurf_ui;
 pub mod hashing;
 pub mod manifest;
 pub mod plan;

@@ -229,6 +229,60 @@ measure the bootstrap's dependencies/glibc floor; Windows verification does not
 prove Linux runtime behavior. The synthetic loopback fixtures and native
 handoff adapter are never distribution files or production-feed evidence.
 
+### World of Surf launcher presentation
+
+The Surf bootstrap now displays **World of Surf** branding: a large neon SURF
+wordmark, an animated sunset/ramp illustration, and a cyan/violet live download
+dashboard. A slow neon sheen crosses the letters; stars twinkle, the sun glows,
+and ocean waves flow. Artwork also animates while awaiting Enter confirmation.
+Animation uses the existing 160 ms terminal cadence, with no GPU or extra worker.
+This is presentation only: `ftesurf-launcher`, install paths, feed URLs, signing
+keys and the game's name/configuration remain compatible pending the full rename.
+The Quakers entry point retains its existing UI.
+
+Interactive launches use **Enter / Y** to enable first-run updates, confirm a
+planned download, and launch once the existing install-readiness checks pass.
+**Esc / N / Q / Ctrl-C** declines the displayed question. Declining first-run
+update permission stores opt-out as before; declining download or launch exits
+without starting the game. `--yes` skips these questions for automation;
+`--no-launch` never asks to launch. Redirected output stays plain and does not
+open the dashboard or add prompts; first-run permission still requires an
+interactive terminal or explicit `--yes` / `--offline`.
+
+The main percentage counts **successfully verified files**, not received bytes.
+Each worker has a live **staged-byte** bar; a full worker bar alone is not a hash
+verification or install-completion claim. Verified-byte content meters and
+smoothed receive speed/approximate ETA accompany it. Resumed files count when
+verified even if no bytes arrive from the network, and repeated/corrupt transfers
+cannot manufacture completion. Incomplete percentages are floored, so 299/300
+verified files still read 99%, never 100%. During transfers, Esc / N / Q / Ctrl-C
+cancels through normal control flow, restores the terminal, drains the downloader
+workers, and retains partial files for resuming without installing or launching.
+Smaller terminals use a compact wordmark/layout.
+No artwork downloads, extra dependencies, graphics window or GPU rendering.
+
+Safe artwork preview (sample data only, no network/install writes/game launch):
+
+```sh
+cargo build --locked --bin ftesurf-launcher
+ftesurf-launcher --ui-preview
+# Live sample animation only; Enter or Esc closes (interactive terminal required).
+ftesurf-launcher --ui-demo
+cargo test --locked --lib -- --test-threads=1
+# Client-free native terminal control probe (no game or official feed).
+cargo build --locked --example world_of_surf_ui_probe
+```
+
+The control example supports `--normal-stop`, terminal cancellation, or
+`--transfer <owned-empty-staging-root> <http://127.0.0.1:port>` against a deliberately
+slow local fixture serving one MiB of `W` bytes. It never installs or launches a
+game; transfer mode asserts that cancellation acted after staging nonzero bytes.
+
+`--ui-preview` is plain text for easy inspection; `--ui-demo` shows live artwork
+animation with clearly labeled sample progress. Neither performs install, network
+or game operations. Real terminal downloads use the colored dashboard. This bootstrap is still upgraded through official archives,
+not the ordinary content feed. Windows validation does not prove Linux behavior.
+
 ## Next (Quakers)
 
 1. Create the R2 bucket + custom domain and push (`deploy/rclone-and-r2-setup.md`), then validate

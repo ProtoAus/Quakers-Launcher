@@ -27,6 +27,13 @@ enum DownloadPolicy {
     Ftesurf,
 }
 
+#[derive(Clone, Copy)]
+enum Display {
+    Quiet,
+    Quakers,
+    WorldOfSurf,
+}
+
 fn part_path(dest: &Path) -> PathBuf {
     let mut part = dest.as_os_str().to_owned();
     part.push(".part");
@@ -135,7 +142,7 @@ pub async fn download_all(
         total_bytes,
         concurrency,
         header,
-        true,
+        Display::Quakers,
         DownloadPolicy::Quakers,
     )
     .await
@@ -161,7 +168,7 @@ pub async fn download_all_quiet(
         total_bytes,
         concurrency,
         ui::Header::default(),
-        false,
+        Display::Quiet,
         DownloadPolicy::Quakers,
     )
     .await
@@ -179,6 +186,38 @@ pub async fn download_all_ftesurf(
     total_bytes: u64,
     concurrency: usize,
 ) -> Result<DlOutcome> {
+    download_ftesurf(client, mirrors, algo, install_dir, jobs, total_bytes, concurrency,
+        ui::Header::default(), Display::Quiet).await
+}
+
+/// Branded presentation over the same guarded staging transport.
+#[allow(clippy::too_many_arguments)]
+pub async fn download_all_ftesurf_with_ui(
+    client: reqwest::Client,
+    mirrors: Vec<String>,
+    algo: String,
+    install_dir: PathBuf,
+    jobs: Vec<FileEntry>,
+    total_bytes: u64,
+    concurrency: usize,
+    header: ui::Header,
+) -> Result<DlOutcome> {
+    download_ftesurf(client, mirrors, algo, install_dir, jobs, total_bytes, concurrency,
+        header, Display::WorldOfSurf).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_ftesurf(
+    client: reqwest::Client,
+    mirrors: Vec<String>,
+    algo: String,
+    install_dir: PathBuf,
+    jobs: Vec<FileEntry>,
+    total_bytes: u64,
+    concurrency: usize,
+    header: ui::Header,
+    display: Display,
+) -> Result<DlOutcome> {
     #[cfg(not(any(target_os = "linux", windows)))]
     return Err(anyhow!(Permanent(
         "hardened staging opens unsupported on this platform".into()
@@ -195,8 +234,8 @@ pub async fn download_all_ftesurf(
         jobs,
         total_bytes,
         concurrency,
-        ui::Header::default(),
-        false,
+        header,
+        display,
         DownloadPolicy::Ftesurf,
     )
     .await
@@ -212,7 +251,7 @@ async fn download_all_inner(
     total_bytes: u64,
     concurrency: usize,
     header: ui::Header,
-    show_ui: bool,
+    display: Display,
     policy: DownloadPolicy,
 ) -> Result<DlOutcome> {
     let total_jobs = jobs.len();
@@ -239,10 +278,13 @@ async fn download_all_inner(
             .map(|e| progress.category_index(&e.path))
             .collect(),
     );
-    let ui_handle = if show_ui {
-        ui::start(progress.clone())
-    } else {
-        None
+    let (ui_handle, cancellation) = match display {
+        Display::Quiet => (None, None),
+        Display::Quakers => (ui::start(progress.clone()), None),
+        Display::WorldOfSurf => match crate::ftesurf_ui::start(progress.clone()) {
+            Some((stop, cancelled, handle)) => (Some((stop, handle)), Some(cancelled)),
+            None => (None, None),
+        },
     };
 
     let jobs = Arc::new(jobs);
@@ -250,7 +292,7 @@ async fn download_all_inner(
     let ok = Arc::new(AtomicU64::new(0));
     let failed = Arc::new(tokio::sync::Mutex::new(Vec::<(String, String)>::new()));
 
-    let mut handles = Vec::new();
+    let mut tasks = tokio::task::JoinSet::new();
     for wid in 0..n {
         let client = client.clone();
         let mirrors = mirrors.clone();
@@ -263,7 +305,7 @@ async fn download_all_inner(
         let progress = progress.clone();
         let cat_idx = cat_idx.clone();
 
-        handles.push(tokio::spawn(async move {
+        tasks.spawn(async move {
             loop {
                 let i = idx.fetch_add(1, Ordering::SeqCst);
                 if i >= jobs.len() {
@@ -281,7 +323,7 @@ async fn download_all_inner(
                 {
                     Ok(()) => {
                         ok.fetch_add(1, Ordering::SeqCst);
-                        progress.file_done();
+                        progress.file_verified(entry.size, cat);
                     }
                     Err(e) => failed
                         .lock()
@@ -290,16 +332,31 @@ async fn download_all_inner(
                 }
             }
             progress.worker_idle(wid);
-        }));
+        });
     }
 
-    for h in handles {
-        let _ = h.await;
+    let mut interrupted = false;
+    while !tasks.is_empty() {
+        tokio::select! {
+            _ = tasks.join_next() => (),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)), if cancellation.is_some() => {
+                if cancellation.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    interrupted = true;
+                    tasks.abort_all();
+                    // Drain aborted workers before restoring the screen and returning to the caller.
+                    while tasks.join_next().await.is_some() {}
+                    break;
+                }
+            }
+        }
     }
     if let Some((stop, handle)) = ui_handle {
         stop.store(true, Ordering::Relaxed);
         let _ = handle.join();
     }
+
+    anyhow::ensure!(!interrupted && !cancellation.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)),
+        "download cancelled; partial files are retained for resume, no installation was started");
 
     let failed = Arc::try_unwrap(failed)
         .map(|m| m.into_inner())

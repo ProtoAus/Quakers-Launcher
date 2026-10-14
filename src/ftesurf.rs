@@ -1,21 +1,27 @@
-//! Minimal FTESurf entry point. No TUI/runtime/daemon: check, update, launch.
+//! World of Surf presentation for the signed FTESurf bootstrap: check, update, launch.
 use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
 use fs2::FileExt;
-use quakers_launcher::{download, ftesurf_update as u};
+use quakers_launcher::{download, ftesurf_update as u, ftesurf_ui as ui};
 use std::{
     fs,
-    io::{self, IsTerminal, Write},
+    io,
     path::PathBuf,
     time::Duration,
 };
 
 #[derive(Parser)]
 #[command(
-    name = "FTESurf",
-    about = "Update FTESurf, then play. Settings and mounted games are never updated."
+    name = "World of Surf",
+    about = "World of Surf Launcher. Update, verify, then play. Settings and mounted games are never updated."
 )]
 struct Args {
+    /// Render sample artwork/progress only; no network, install writes or game launch.
+    #[arg(long)]
+    ui_preview: bool,
+    /// Animate the logo/artwork with sample data only; Enter or Esc closes the preview.
+    #[arg(long, conflicts_with = "ui_preview")]
+    ui_demo: bool,
     #[arg(long)]
     dir: Option<PathBuf>,
     /// Consent once without the interactive first-run question (automation/installers).
@@ -49,9 +55,20 @@ struct Args {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    if args.ui_preview {
+        print!("{}", ui::preview());
+        return;
+    }
+    if args.ui_demo {
+        if let Err(e) = ui::demo() {
+            eprintln!("World of Surf preview: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Err(e) = run(&args).await {
-        eprintln!("FTESurf: {e:#}\nNo game was started. Close FTESurf and retry; partial updates are resumed, not launched.");
-        if !args.no_launch && io::stdin().is_terminal() {
+        eprintln!("World of Surf: {e:#}\nThe launcher did not complete. Close the game and retry; partial updates are resumed, never launched.");
+        if !args.no_launch && ui::interactive(args.yes) {
             eprint!("Press Enter to close.");
             let _ = io::stdin().read_line(&mut String::new());
         }
@@ -90,6 +107,7 @@ async fn fetch(client: &reqwest::Client, args: &Args) -> Result<String> {
 }
 
 async fn run(a: &Args) -> Result<()> {
+    ui::welcome()?;
     let root = a.dir.clone().unwrap_or(
         std::env::current_exe()?
             .parent()
@@ -142,16 +160,11 @@ async fn run(a: &Args) -> Result<()> {
         fs::read_to_string(&consent)?.trim() == "1"
     } else {
         ensure!(
-            io::stdin().is_terminal(),
-            "first launch needs consent; use --yes to enable updates or --offline to skip"
+            ui::interactive(false),
+            "first launch needs an interactive terminal; use --yes to enable updates or --offline to skip"
         );
-        println!("FTESurf can automatically check proto.bar and download updates from dl.proto.bar on launch.\nThose services see your IP address; no settings, recordings or mounted game assets are uploaded.\nEnable automatic updates? [Y/n]");
-        io::stdout().flush()?;
-        let mut line = String::new();
-        io::stdin().read_line(&mut line)?;
-        let on = line.trim().is_empty()
-            || line.trim().eq_ignore_ascii_case("y")
-            || line.trim().eq_ignore_ascii_case("yes");
+        println!("World of Surf can automatically check proto.bar and download updates from dl.proto.bar on launch.\nThose services see your IP address; no settings, recordings or mounted game assets are uploaded.");
+        let on = ui::confirm("Enable automatic updates?", false)?;
         if !a.dry_run {
             u::write_meta(&root, "consent", if on { b"1\n" } else { b"0\n" })?;
         }
@@ -160,7 +173,7 @@ async fn run(a: &Args) -> Result<()> {
     ensure!(!ingame_pending || (enabled && !a.offline), "unfinished in-game update: enable updates so the launcher can verify and repair the complete signed release");
     let mut launch_manifest = None;
     if enabled && !a.offline {
-        println!("FTESurf: checking for updates...");
+        println!("World of Surf: checking the signed release...");
         let client = reqwest::Client::builder()
             .user_agent("FTESurf-Launcher/0.1")
             .connect_timeout(Duration::from_secs(4))
@@ -192,8 +205,13 @@ async fn run(a: &Args) -> Result<()> {
                         jobs.len(),
                         jobs.iter().map(|f| f.size).sum::<u64>() as f64 / 1048576.0
                     );
+                    if !ui::confirm(&format!("Download {} file(s) / {} to {}?", jobs.len(),
+                        ui::human(jobs.iter().map(|f| f.size).sum()), root.display()), a.yes)? {
+                        println!("Download cancelled. No game was started.");
+                        return Ok(());
+                    }
                     let staging = u::checked_path(&root, ".ftesurf-updater/download")?;
-                    let outcome = download::download_all_ftesurf(
+                    let outcome = download::download_all_ftesurf_with_ui(
                         client,
                         m.mirrors.clone(),
                         m.hash_algo.clone(),
@@ -201,6 +219,12 @@ async fn run(a: &Args) -> Result<()> {
                         jobs.clone(),
                         jobs.iter().map(|f| f.size).sum(),
                         3,
+                        quakers_launcher::ui::Header {
+                            system: String::new(),
+                            platform: quakers_launcher::manifest::platform_key().into(),
+                            release: m.version.clone(),
+                            mirror: m.mirrors.join(" · "),
+                        },
                     )
                     .await?;
                     ensure!(
@@ -208,6 +232,7 @@ async fn run(a: &Args) -> Result<()> {
                         "download failed: {:?}; existing installation was not changed",
                         outcome.failed
                     );
+                    println!("Downloads verified. Installing the signed release...");
                     u::begin(&root, &envelope, &jobs)?;
                     u::recover(&root, a.allow_insecure).await?;
                 } else {
@@ -237,7 +262,7 @@ async fn run(a: &Args) -> Result<()> {
                     fs::rename(&ingame_journal, saved)?;
                     println!("Recovered the interrupted in-game update.");
                 }
-                println!("FTESurf {} is ready.", m.version);
+                println!("World of Surf {} is ready.", m.version);
                 launch_manifest = Some(m);
             }
             Err(e) => {
@@ -267,6 +292,10 @@ async fn run(a: &Args) -> Result<()> {
         exe.is_file() && u::checked_path(&root, "default.fmf")?.is_file(),
         "FTESurf is not installed here; enable updates to install it"
     );
+    if !ui::confirm("WORLD OF SURF is ready. Press Enter to launch.", a.yes)? {
+        println!("Launch cancelled. Your installation is ready for next time.");
+        return Ok(());
+    }
     if let Some(m) = &launch_manifest {
         u::check_complete(&root, m).await?;
     }
