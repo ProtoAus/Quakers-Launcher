@@ -40,16 +40,18 @@ const LOGO: [&str; 6] = [
     "███████║╚██████╔╝██║  ██║██║     ",
     "╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝     ",
 ];
-const COAST: [&str; 9] = [
-    "           ·             .       *",
-    "    .             ▄████▄",
-    "                 ████████     ·",
-    "          ________▀████▀________",
-    "       __/   /   /   /   /   /  /",
-    "    __/____/___/___/___/___/___/",
-    " __/   /   /   /   /   /   /",
-    "╱____/___/___/___/___/___/   ~ ~ ~",
-    "   ~ ~ ~    ~ ~ ~    ~ ~ ~    ~ ~",
+// Plain ASCII: a curling wave and moving water, not an abstract ramp/sky scene.
+const WAVE: [&str; 10] = [
+    r"                    __",
+    r"                 .-'  `-.",
+    r"               .'  .--.  \",
+    r"              /  .'    \  |",
+    r"             /  /       | /",
+    r"            /   `---.__.-'",
+    r"       ____/            /",
+    r" _____/                /",
+    r"/_____________________/____",
+    r"  ~~~~   ~~~~   ~~~~   ~~~~",
 ];
 
 pub fn interactive(assume_yes: bool) -> bool {
@@ -93,34 +95,17 @@ fn logo_line(line: &str, row: usize, tick: usize) -> Line<'static> {
     )
 }
 
-fn coast_line(line: &str, row: usize, tick: usize) -> Line<'static> {
+fn wave_line(line: &str, row: usize, tick: usize) -> Line<'static> {
     let mut chars: Vec<_> = line.chars().collect();
-    if row == COAST.len() - 1 {
+    // Keep the curl steady/readable; only the waterline flows sideways.
+    if row == WAVE.len() - 1 {
         let shift = (tick / 2) % chars.len();
         chars.rotate_left(shift);
     }
-    let pulse = (tick % 32).min(32 - tick % 32) as u8;
-    Line::from(
-        chars
-            .into_iter()
-            .enumerate()
-            .map(|(column, ch)| {
-                let color = match ch {
-                    '.' | '·' | '*' => {
-                        if (tick / 3 + column + row * 5) % 16 < 3 {
-                            WHITE
-                        } else {
-                            DIM
-                        }
-                    }
-                    '█' | '▄' | '▀' => Color::Rgb(211 + pulse, 136 + pulse, 230 + pulse),
-                    _ if row < 4 => PURPLE,
-                    _ => CYAN,
-                };
-                Span::styled(ch.to_string(), Style::new().fg(color))
-            })
-            .collect::<Vec<_>>(),
-    )
+    // Equal-width rows center the picture as one block, preserving the outline.
+    let width = WAVE.iter().map(|line| line.len()).max().unwrap_or(0);
+    let text = chars.into_iter().collect::<String>();
+    Line::from(format!("{text:width$}")).style(Style::new().fg(if row < 6 { WHITE } else { CYAN }))
 }
 
 fn hero(f: &mut Frame, area: Rect, compact: bool, tick: usize) {
@@ -147,10 +132,10 @@ fn hero(f: &mut Frame, area: Rect, compact: bool, tick: usize) {
     lines.push(Line::default());
     lines.push(Line::from("WORLD OF SURF  /  LAUNCHER").style(Style::new().fg(DIM)));
     f.render_widget(Paragraph::new(lines).centered(), cols[0]);
-    let scene: Vec<_> = COAST
+    let scene: Vec<_> = WAVE
         .iter()
         .enumerate()
-        .map(|(i, s)| coast_line(s, i, tick))
+        .map(|(i, s)| wave_line(s, i, tick))
         .collect();
     f.render_widget(Paragraph::new(scene).centered(), cols[1]);
 }
@@ -670,6 +655,23 @@ mod tests {
         assert!(b.content.iter().any(|c| c.fg == PURPLE));
         save_snapshot("preview-cells.json", &b);
     }
+    #[test]
+    fn wave_is_plain_ascii_and_visible_at_normal_console_width() {
+        assert!(WAVE.iter().all(|line| line.is_ascii()));
+        let art_width = WAVE.iter().map(|line| line.len()).max().unwrap();
+        for (row, line) in WAVE.iter().enumerate() {
+            assert_eq!(wave_line(line, row, 0).width(), art_width);
+        }
+        for width in [80, 100] {
+            let s = text(&render_sample(width, 32));
+            for line in WAVE {
+                assert!(s.contains(line.trim()), "missing wave row: {line}");
+            }
+        }
+        assert_ne!(wave_line(WAVE[9], 9, 0), wave_line(WAVE[9], 9, 2));
+        assert_eq!(wave_line(WAVE[3], 3, 0), wave_line(WAVE[3], 3, 15));
+    }
+
     #[test]
     fn compact_and_tiny_terminals_do_not_panic() {
         for (w, h) in [(60, 24), (40, 12), (20, 8), (1, 1), (0, 0)] {

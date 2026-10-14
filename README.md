@@ -232,9 +232,11 @@ handoff adapter are never distribution files or production-feed evidence.
 ### World of Surf launcher presentation
 
 The Surf bootstrap now displays **World of Surf** branding: a large neon SURF
-wordmark, an animated sunset/ramp illustration, and a cyan/violet live download
-dashboard. A slow neon sheen crosses the letters; stars twinkle, the sun glows,
-and ocean waves flow. Artwork also animates while awaiting Enter confirmation.
+wordmark, a plain ASCII curling ocean wave, and a cyan/violet live download
+dashboard. The abstract ramp/sun/stars scene was removed after operator feedback.
+A slow neon sheen crosses the letters; the wave's curl stays steady and readable
+while its waterline moves sideways. Artwork also animates while awaiting Enter
+confirmation.
 Animation uses the existing 160 ms terminal cadence, with no GPU or extra worker.
 This is presentation only: `ftesurf-launcher`, install paths, feed URLs, signing
 keys and the game's name/configuration remain compatible pending the full rename.
