@@ -40,19 +40,6 @@ const LOGO: [&str; 6] = [
     "███████║╚██████╔╝██║  ██║██║     ",
     "╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝     ",
 ];
-// Plain ASCII: a curling wave and moving water, not an abstract ramp/sky scene.
-const WAVE: [&str; 10] = [
-    r"                    __",
-    r"                 .-'  `-.",
-    r"               .'  .--.  \",
-    r"              /  .'    \  |",
-    r"             /  /       | /",
-    r"            /   `---.__.-'",
-    r"       ____/            /",
-    r" _____/                /",
-    r"/_____________________/____",
-    r"  ~~~~   ~~~~   ~~~~   ~~~~",
-];
 
 pub fn interactive(assume_yes: bool) -> bool {
     !assume_yes && io::stdin().is_terminal() && io::stdout().is_terminal()
@@ -95,19 +82,6 @@ fn logo_line(line: &str, row: usize, tick: usize) -> Line<'static> {
     )
 }
 
-fn wave_line(line: &str, row: usize, tick: usize) -> Line<'static> {
-    let mut chars: Vec<_> = line.chars().collect();
-    // Keep the curl steady/readable; only the waterline flows sideways.
-    if row == WAVE.len() - 1 {
-        let shift = (tick / 2) % chars.len();
-        chars.rotate_left(shift);
-    }
-    // Equal-width rows center the picture as one block, preserving the outline.
-    let width = WAVE.iter().map(|line| line.len()).max().unwrap_or(0);
-    let text = chars.into_iter().collect::<String>();
-    Line::from(format!("{text:width$}")).style(Style::new().fg(if row < 6 { WHITE } else { CYAN }))
-}
-
 fn hero(f: &mut Frame, area: Rect, compact: bool, tick: usize) {
     if compact {
         f.render_widget(
@@ -120,8 +94,6 @@ fn hero(f: &mut Frame, area: Rect, compact: bool, tick: usize) {
         );
         return;
     }
-    let cols =
-        Layout::horizontal([Constraint::Percentage(54), Constraint::Percentage(46)]).split(area);
     let mut lines = vec![
         Line::from("W O R L D   O F").style(Style::new().fg(WHITE).bold()),
         Line::default(),
@@ -131,13 +103,7 @@ fn hero(f: &mut Frame, area: Rect, compact: bool, tick: usize) {
     }
     lines.push(Line::default());
     lines.push(Line::from("WORLD OF SURF  /  LAUNCHER").style(Style::new().fg(DIM)));
-    f.render_widget(Paragraph::new(lines).centered(), cols[0]);
-    let scene: Vec<_> = WAVE
-        .iter()
-        .enumerate()
-        .map(|(i, s)| wave_line(s, i, tick))
-        .collect();
-    f.render_widget(Paragraph::new(scene).centered(), cols[1]);
+    f.render_widget(Paragraph::new(lines).centered(), area);
 }
 
 #[derive(Default)]
@@ -656,20 +622,21 @@ mod tests {
         save_snapshot("preview-cells.json", &b);
     }
     #[test]
-    fn wave_is_plain_ascii_and_visible_at_normal_console_width() {
-        assert!(WAVE.iter().all(|line| line.is_ascii()));
-        let art_width = WAVE.iter().map(|line| line.len()).max().unwrap();
-        for (row, line) in WAVE.iter().enumerate() {
-            assert_eq!(wave_line(line, row, 0).width(), art_width);
-        }
+    fn header_is_logo_only_and_centered_across_the_full_width() {
         for width in [80, 100] {
-            let s = text(&render_sample(width, 32));
-            for line in WAVE {
-                assert!(s.contains(line.trim()), "missing wave row: {line}");
-            }
+            let mut t = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            t.draw(|f| hero(f, f.area(), false, 0)).unwrap();
+            let b = t.backend().buffer();
+            let s = text(b);
+            assert!(s.contains("WORLD OF SURF"));
+            assert!(!s.contains('~') && !s.contains('\\'));
+            let ink: Vec<_> = (0..width).filter(|x| b[(*x, 2)].symbol() != " ").collect();
+            let left = *ink.first().unwrap();
+            let right = width - ink.last().unwrap() - 1;
+            // Odd spare widths necessarily give one side one extra blank cell.
+            assert!(left.abs_diff(right) <= 1);
+            assert_eq!(b[(left, 2)].symbol(), "█");
         }
-        assert_ne!(wave_line(WAVE[9], 9, 0), wave_line(WAVE[9], 9, 2));
-        assert_eq!(wave_line(WAVE[3], 3, 0), wave_line(WAVE[3], 3, 15));
     }
 
     #[test]
