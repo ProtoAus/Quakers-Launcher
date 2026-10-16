@@ -224,6 +224,7 @@ pub fn managed(p: &str) -> bool {
             | "ftesurf/data/mapwr.txt"
             | "ftesurf/data/mapdl.txt"
             | "ftesurf/data/mapmanifest.txt"
+            | "ftesurf/maps/tiers.txt"
     ) {
         return true;
     }
@@ -593,6 +594,9 @@ mod tests {
             "qkey",
             "hl2/pak01_dir.vpk",
             "ftesurf/maps/a.bsp",
+            "ftesurf/maps/tiers-other.txt",
+            "ftesurf/maps/tiers.txt/extra",
+            "ftesurf/maps/TIERS.txt",
             "ftesurf/cfg/settings.cfg",
             "../LICENSE",
             "ftesurf/gfx/../../data/consent.txt",
@@ -606,6 +610,7 @@ mod tests {
             "ftesurf/maps/zones/local/surf_a.json",
             "ftesurf/fs_addons.txt",
             "ftesurf/data/mapdl.txt",
+            "ftesurf/maps/tiers.txt",
         ] {
             assert!(managed(p), "{p}");
         }
