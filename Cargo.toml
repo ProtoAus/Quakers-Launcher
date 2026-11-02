@@ -10,7 +10,7 @@ name = "quakers-launcher"
 path = "src/main.rs"
 
 [[bin]]
-name = "ftesurf-launcher"
+name = "WOS-Launcher"   # P1209: was ftesurf-launcher
 path = "src/ftesurf.rs"
 
 [lib]

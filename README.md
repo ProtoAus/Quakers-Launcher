@@ -161,16 +161,16 @@ BLAKE2b-256 is in the Python stdlib, so any machine can publish with no dependen
 
 ## FTESurf bootstrap (separate from the Quakers profile)
 
-`cargo build --locked --release --bin ftesurf-launcher` builds the small FTESurf
-entry point. Put `ftesurf-launcher.exe` (Windows) or `ftesurf-launcher` (Linux)
+`cargo build --locked --release --bin WOS-Launcher` builds the small FTESurf
+entry point. Put `WOS-Launcher.exe` (Windows) or `WOS-Launcher` (Linux; before P1209 `ftesurf-launcher`)
 beside the engine and `default.fmf`, not inside the gamedir. It uses its own
 executable's folder as the install root, starts the real engine in that folder,
 and waits for the game to exit. Engine arguments follow `--` unchanged:
 
 ```
-ftesurf-launcher.exe -- -window +map surf_example
-ftesurf-launcher.exe --offline
-ftesurf-launcher.exe --enable-updates
+WOS-Launcher.exe -- -window +map surf_example
+WOS-Launcher.exe --offline
+WOS-Launcher.exe --enable-updates
 ```
 
 The first interactive launch asks permission. `--yes` enables permission for
@@ -242,7 +242,7 @@ needs no GPU or downloaded artwork; resizing redraws the same header and palette
 not briefly restored plain-text screens. The full 32-cell wordmark remains at
 80×24, 60×24 and 40×20; it compacts only below 34 columns or 18 rows.
 The transport now uses four actual parallel downloads, not three cosmetic slots.
-Identity and verification policy are unchanged: `ftesurf-launcher`, install paths, feed URLs, signing
+Identity and verification policy are unchanged: `WOS-Launcher` (was `ftesurf-launcher`), install paths, feed URLs, signing
 keys and the game's name/configuration remain compatible pending the full rename.
 The Quakers entry point retains its existing UI.
 
@@ -294,10 +294,10 @@ previous 13,379,584-byte development preview, with the same TLS/signature checks
 Safe logo preview (sample data only, no network/install writes/game launch):
 
 ```sh
-cargo build --release --locked --bin ftesurf-launcher
-ftesurf-launcher --ui-preview
+cargo build --release --locked --bin WOS-Launcher
+WOS-Launcher --ui-preview
 # Live sample animation only; Enter or Esc closes (interactive terminal required).
-ftesurf-launcher --ui-demo
+WOS-Launcher --ui-demo
 cargo test --locked --lib -- --test-threads=1
 # Client-free native terminal control probe (no game or official feed).
 cargo build --release --locked --example world_of_surf_ui_probe
