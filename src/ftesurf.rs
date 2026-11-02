@@ -203,7 +203,16 @@ async fn run(a: &Args) -> Result<()> {
     ensure!(!ingame_pending || (enabled && !a.offline), "unfinished in-game update: enable updates so the launcher can verify and repair the complete signed release");
     let mut launch_manifest = None;
     if enabled && !a.offline {
-        ui::message("Checking for updates…", "Verifying the signed release.")?;
+        // P1208: say what is installed before anything is fetched.
+        let have = u::load_state(&root).map(|s| s.version).unwrap_or_default();
+        ui::message(
+            "Checking for updates…",
+            &if have.is_empty() {
+                "Verifying the signed release.".to_string()
+            } else {
+                format!("Installed: World of Surf {have}. Verifying the signed release.")
+            },
+        )?;
         let client = reqwest::Client::builder()
             .user_agent("FTESurf-Launcher/0.1")
             .connect_timeout(Duration::from_secs(4))
@@ -214,6 +223,12 @@ async fn run(a: &Args) -> Result<()> {
                 // Bad signatures/formats do NOT fall back and launch as if this were a network outage.
                 let m = u::decode(&envelope, u::PUBLIC_KEY, a.allow_insecure)?;
                 let old = u::load_state(&root)?;
+                let from = old.version.clone(); // P1208: empty for a fresh or adopted install
+                let change = if from.is_empty() || from == m.version {
+                    format!("World of Surf {}", m.version)
+                } else {
+                    format!("World of Surf {} \u{2192} {}", from, m.version)
+                };
                 if !old.version.is_empty() {
                     ensure!(
                         u::version(&m.version)? >= u::version(&old.version)?,
@@ -226,7 +241,7 @@ async fn run(a: &Args) -> Result<()> {
                 }
                 if a.dry_run {
                     ui::message(
-                        &format!("{} file(s) would update to {}", jobs.len(), m.version),
+                        &format!("{} file(s) would update: {change}", jobs.len()),
                         "",
                     )?;
                     return Ok(());
@@ -236,11 +251,11 @@ async fn run(a: &Args) -> Result<()> {
                     if !install_approved
                         && !ui::choose(
                             if installed {
-                                "Download update?"
+                                "Update World of Surf?"
                             } else {
                                 "Download World of Surf?"
                             },
-                            &ui::human(total_bytes),
+                            &format!("{change}  \u{b7}  {}", ui::human(total_bytes)),
                             a.yes,
                         )?
                     {
@@ -261,6 +276,7 @@ async fn run(a: &Args) -> Result<()> {
                             platform: quakers_launcher::manifest::platform_key().into(),
                             release: m.version.clone(),
                             mirror: m.mirrors.join(" · "),
+                            from: from.clone(),
                         },
                     )
                     .await?;
@@ -299,7 +315,16 @@ async fn run(a: &Args) -> Result<()> {
                     fs::rename(&ingame_journal, saved)?;
                     ui::message("Recovered the interrupted in-game update.", "")?;
                 }
-                ui::message(&format!("World of Surf {} is ready.", m.version), "")?;
+                ui::message(
+                    &if from == m.version && jobs.is_empty() {
+                        format!("World of Surf {} is up to date.", m.version)
+                    } else if !from.is_empty() && from != m.version {
+                        format!("Updated World of Surf {} \u{2192} {}.", from, m.version)
+                    } else {
+                        format!("World of Surf {} is ready.", m.version)
+                    },
+                    "",
+                )?;
                 launch_manifest = Some(m);
             }
             Err(e) => {

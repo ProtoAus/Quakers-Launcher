@@ -178,6 +178,19 @@ fn meter(f: &mut Frame, area: Rect, value: f64, label: String, color: Color) {
         area,
     );
 }
+/// P1208: the release coming and the one it replaces, when the line has room for them.
+fn download_title(h: &Header, width: u16) -> String {
+    let plain = "Downloading World of Surf".to_string();
+    let full = if !h.from.is_empty() && !h.release.is_empty() && h.from != h.release {
+        format!("Updating World of Surf {} \u{2192} {}", h.from, h.release)
+    } else if !h.release.is_empty() {
+        format!("Downloading World of Surf {}", h.release)
+    } else {
+        return plain;
+    };
+    if full.chars().count() <= width as usize { full } else { plain }
+}
+
 fn draw_download(f: &mut Frame, p: &Progress, rate: &Rate, tick: usize, preview: bool) {
     let body = base(
         f,
@@ -195,7 +208,7 @@ fn draw_download(f: &mut Frame, p: &Progress, rate: &Rate, tick: usize, preview:
         },
     );
     f.render_widget(
-        Paragraph::new("Downloading World of Surf")
+        Paragraph::new(download_title(&p.header, body.width))
             .fg(WHITE)
             .centered(),
         row(body, 0, 1),
@@ -701,7 +714,7 @@ fn sample() -> Arc<Progress> {
         120,
         4,
         vec![("Game data", 60 * mib)],
-        Header::default(),
+        Header { from: "0.1.35".into(), release: "0.1.36".into(), ..Header::default() },
     );
     p.files_done.store(60, Ordering::Relaxed);
     p.verified_bytes.store(30 * mib, Ordering::Relaxed);
@@ -754,6 +767,16 @@ pub fn preview() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_title_names_the_installed_and_target_release() {
+        let up = Header { from: "0.1.35".into(), release: "0.1.36".into(), ..Header::default() };
+        assert_eq!(download_title(&up, 80), "Updating World of Surf 0.1.35 \u{2192} 0.1.36");
+        assert_eq!(download_title(&up, 20), "Downloading World of Surf");
+        let fresh = Header { release: "0.1.36".into(), ..Header::default() };
+        assert_eq!(download_title(&fresh, 80), "Downloading World of Surf 0.1.36");
+        assert_eq!(download_title(&Header::default(), 80), "Downloading World of Surf");
+    }
     fn save_snapshot(name: &str, buffer: &Buffer) {
         if let Some(root) = std::env::var_os("FTESURF_UI_SNAPSHOT_ROOT") {
             let cells: Vec<_> = buffer

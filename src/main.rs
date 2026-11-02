@@ -286,6 +286,7 @@ async fn run(args: Args) -> Result<()> {
                 platform: manifest::platform_key().to_string(),
                 release: format!("{} · {}", manifest.channel, manifest.version),
                 mirror: host_of(&source),
+                from: String::new(),
             },
         )
         .await?;

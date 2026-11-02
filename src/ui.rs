@@ -68,6 +68,8 @@ pub struct Header {
     pub platform: String,
     pub release: String,
     pub mirror: String,
+    /// P1208: the installed release this download replaces; empty for a fresh install.
+    pub from: String,
 }
 
 /// Which bucket a manifest path belongs to. Paths look like "quakers/models/..."
@@ -724,6 +726,7 @@ pub fn preview() -> String {
         platform: crate::manifest::platform_key().to_string(),
         release: "alpha · 2026.07.27_1".to_string(),
         mirror: "dl.proto.bar".to_string(),
+        from: String::new(),
     };
     let p = Progress::new(total, 13786, 4, cats, header);
     p.done_bytes.store((total as f64 * 0.19) as u64, Ordering::Relaxed);
