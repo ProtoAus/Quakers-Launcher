@@ -616,6 +616,31 @@ mod tests {
         }
     }
     #[test]
+    fn generated_map_tables_use_existing_asset_namespace() {
+        for name in ["matcolours", "unshipped"] {
+            let path = format!("ftesurf/scripts/{name}.txt");
+            assert!(managed(&path), "{path}");
+            for bad in [
+                path.to_ascii_uppercase(),
+                format!("{path}."),
+                format!("{path} "),
+                format!("{path}:stream"),
+                format!("ftesurf/scripts/../data/{name}.txt"),
+                format!("ftesurf/data/{name}.txt"),
+            ] {
+                assert!(!managed(&bad), "{bad}");
+            }
+        }
+        for bad in [
+            "ftesurf/data/consent.txt",
+            "ftesurf/data/player.txt",
+            "ftesurf/data/settings.txt",
+        ] {
+            assert!(!managed(bad), "{bad}");
+        }
+    }
+
+    #[test]
     fn versions_are_numeric_not_lexical() {
         assert!(version("0.1.100").unwrap() > version("0.1.99").unwrap());
         assert!(version("0.1.2/../../x").is_err());
