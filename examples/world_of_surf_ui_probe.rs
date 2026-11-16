@@ -49,6 +49,7 @@ async fn main() -> Result<()> {
             vec![entry],
             bytes.len() as u64,
             1,
+            quakers_launcher::ftesurf_update::Identity::Legacy,
             Header {
                 release: "UI test fixture".into(),
                 mirror: "loopback only".into(),

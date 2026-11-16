@@ -122,10 +122,12 @@ async fn run(a: &Args) -> Result<()> {
             .to_path_buf(),
     );
     ensure!(root.is_dir(), "install directory is missing");
+    // P1593: the install's identity decides which feed, exe and gamedir every check below accepts.
+    let id = u::install_identity(&root)?;
     // Check the root before canonicalizing (which would hide a junction).
-    u::checked_path(&root, ".ftesurf-updater/install.lock")?;
+    u::checked_path(&root, ".ftesurf-updater/install.lock", id)?;
     let root = root.canonicalize()?;
-    let lockpath = u::checked_path(&root, ".ftesurf-updater/install.lock")?;
+    let lockpath = u::checked_path(&root, ".ftesurf-updater/install.lock", id)?;
     fs::create_dir_all(lockpath.parent().unwrap())?;
     let lock = fs::OpenOptions::new()
         .read(true)
@@ -147,23 +149,27 @@ async fn run(a: &Args) -> Result<()> {
             }
         }
     }
+    ensure!(
+        u::install_identity(&root)? == id,
+        "the install's game folder changed while waiting for its lock; start the launcher again"
+    );
     // A source checkout must never be repaired back to the public release.
     let development = root.join(".git").try_exists()?;
     ensure!(
-        !development || !u::checked_path(&root, ".ftesurf-updater/pending.json")?.exists(),
+        !development || !u::checked_path(&root, ".ftesurf-updater/pending.json", id)?.exists(),
         "unfinished release update in a development checkout; resolve it before launching (no files were promoted)"
     );
     // Recovery precedes ALL launch paths, but a dry run must not commit a transaction.
     ensure!(
-        !a.dry_run || !u::checked_path(&root, ".ftesurf-updater/pending.json")?.exists(),
+        !a.dry_run || !u::checked_path(&root, ".ftesurf-updater/pending.json", id)?.exists(),
         "unfinished update: dry run does not recover it; rerun --verify to finish safely"
     );
-    u::recover(&root, a.allow_insecure).await?;
-    let ingame_journal = u::checked_path(&root, ".ftesurf-updater/ingame/journal.json")?;
+    u::recover(&root, a.allow_insecure, id).await?;
+    let ingame_journal = u::checked_path(&root, ".ftesurf-updater/ingame/journal.json", id)?;
     let ingame_pending = ingame_journal.exists();
-    let consent = u::checked_path(&root, ".ftesurf-updater/consent")?;
-    let installed = u::checked_path(&root, u::default_exec())?.is_file()
-        && u::checked_path(&root, "default.fmf")?.is_file();
+    let consent = u::checked_path(&root, ".ftesurf-updater/consent", id)?;
+    let installed = u::checked_path(&root, id.exec(), id)?.is_file()
+        && u::checked_path(&root, "default.fmf", id)?.is_file();
     let mut install_approved = false;
     let enabled = if development {
         ui::message(
@@ -173,7 +179,7 @@ async fn run(a: &Args) -> Result<()> {
         false
     } else if a.yes || a.enable_updates {
         if !a.dry_run {
-            u::write_meta(&root, "consent", b"1\n")?;
+            u::write_meta(&root, "consent", b"1\n", id)?;
         }
         true
     } else if a.offline {
@@ -196,7 +202,7 @@ async fn run(a: &Args) -> Result<()> {
         }
         install_approved = !installed && on;
         if !a.dry_run {
-            u::write_meta(&root, "consent", if on { b"1\n" } else { b"0\n" })?;
+            u::write_meta(&root, "consent", if on { b"1\n" } else { b"0\n" }, id)?;
         }
         on
     };
@@ -204,7 +210,9 @@ async fn run(a: &Args) -> Result<()> {
     let mut launch_manifest = None;
     if enabled && !a.offline {
         // P1208: say what is installed before anything is fetched.
-        let have = u::load_state(&root).map(|s| s.version).unwrap_or_default();
+        let have = u::load_state(&root, id)
+            .map(|s| s.version)
+            .unwrap_or_default();
         ui::message(
             "Checking for updates…",
             &if have.is_empty() {
@@ -221,8 +229,8 @@ async fn run(a: &Args) -> Result<()> {
         match fetch(&client, a).await {
             Ok(envelope) => {
                 // Bad signatures/formats do NOT fall back and launch as if this were a network outage.
-                let m = u::decode(&envelope, u::PUBLIC_KEY, a.allow_insecure)?;
-                let old = u::load_state(&root)?;
+                let m = u::decode(&envelope, u::PUBLIC_KEY, a.allow_insecure, id)?;
+                let old = u::load_state(&root, id)?;
                 let from = old.version.clone(); // P1208: empty for a fresh or adopted install
                 let change = if from.is_empty() || from == m.version {
                     format!("World of Surf {}", m.version)
@@ -235,7 +243,7 @@ async fn run(a: &Args) -> Result<()> {
                         "refusing an older signed release"
                     );
                 }
-                let (jobs, kept) = u::plan(&m, &root, &old).await?;
+                let (jobs, kept) = u::plan(&m, &root, &old, id).await?;
                 for p in &kept {
                     ui::message(&format!("Keeping your local file: {p}"), "")?;
                 }
@@ -262,7 +270,7 @@ async fn run(a: &Args) -> Result<()> {
                         ui::message("Download cancelled. No game was started.", "")?;
                         return Ok(());
                     }
-                    let staging = u::checked_path(&root, ".ftesurf-updater/download")?;
+                    let staging = u::checked_path(&root, ".ftesurf-updater/download", id)?;
                     let outcome = download::download_all_ftesurf_with_ui(
                         client,
                         m.mirrors.clone(),
@@ -271,6 +279,7 @@ async fn run(a: &Args) -> Result<()> {
                         jobs.clone(),
                         total_bytes,
                         4,
+                        id,
                         quakers_launcher::ui::Header {
                             system: String::new(),
                             platform: quakers_launcher::manifest::platform_key().into(),
@@ -286,22 +295,22 @@ async fn run(a: &Args) -> Result<()> {
                         outcome.failed
                     );
                     ui::message("Installing World of Surf…", "Downloads verified.")?;
-                    u::begin(&root, &envelope, &jobs)?;
-                    u::recover(&root, a.allow_insecure).await?;
+                    u::begin(&root, &envelope, &jobs, id)?;
+                    u::recover(&root, a.allow_insecure, id).await?;
                 } else {
                     // Adopt only after bytes AND executable permissions are ready.
-                    u::prepare_install(&root, &m).await?;
+                    u::prepare_install(&root, &m, id).await?;
                     let mut st = old;
                     for f in m.files_for_platform() {
-                        if u::matches(&root, f).await? {
+                        if u::matches(&root, f, id).await? {
                             st.files.insert(f.path.clone(), f.hash.clone());
                         }
                     }
                     st.version = m.version.clone();
-                    u::write_meta(&root, "state.json", &serde_json::to_vec_pretty(&st)?)?;
-                    u::write_meta(&root, "installed.json", envelope.as_bytes())?;
+                    u::write_meta(&root, "state.json", &serde_json::to_vec_pretty(&st)?, id)?;
+                    u::write_meta(&root, "installed.json", envelope.as_bytes(), id)?;
                 }
-                u::check_complete(&root, &m).await?;
+                u::check_complete(&root, &m, id).await?;
                 if ingame_pending {
                     // The fetched signed feed, not untrusted old journal entries, determines
                     // every repair. Preserve the old journal only after the full set verifies.
@@ -311,6 +320,7 @@ async fn run(a: &Args) -> Result<()> {
                     let saved = u::checked_path(
                         &root,
                         &format!(".ftesurf-updater/recovered-ingame-{stamp}.json"),
+                        id,
                     )?;
                     fs::rename(&ingame_journal, saved)?;
                     ui::message("Recovered the interrupted in-game update.", "")?;
@@ -333,17 +343,18 @@ async fn run(a: &Args) -> Result<()> {
                     "Update service unavailable. Checking the installed copy for offline play…",
                     &e.to_string(),
                 )?;
-                let cached = u::checked_path(&root, ".ftesurf-updater/installed.json")?;
+                let cached = u::checked_path(&root, ".ftesurf-updater/installed.json", id)?;
                 ensure!(cached.is_file(), "no verified installation is cached yet; --offline explicitly starts an existing archive installation");
                 let m = u::decode(
                     &fs::read_to_string(cached)?,
                     u::PUBLIC_KEY,
                     a.allow_insecure,
+                    id,
                 )?;
                 if a.dry_run {
-                    u::check_complete(&root, &m).await?;
+                    u::check_complete(&root, &m, id).await?;
                 } else {
-                    u::prepare_install(&root, &m).await?;
+                    u::prepare_install(&root, &m, id).await?;
                 }
                 launch_manifest = Some(m);
             }
@@ -352,9 +363,9 @@ async fn run(a: &Args) -> Result<()> {
     if a.dry_run || a.no_launch {
         return Ok(());
     }
-    let exe = u::checked_path(&root, u::default_exec())?;
+    let exe = u::checked_path(&root, id.exec(), id)?;
     ensure!(
-        exe.is_file() && u::checked_path(&root, "default.fmf")?.is_file(),
+        exe.is_file() && u::checked_path(&root, "default.fmf", id)?.is_file(),
         "FTESurf is not installed here; enable updates to install it"
     );
     if !ui::confirm("Play World of Surf?", a.yes)? {
@@ -366,7 +377,7 @@ async fn run(a: &Args) -> Result<()> {
     }
     if let Some(m) = &launch_manifest {
         ui::message("Verifying World of Surf…", "")?;
-        u::check_complete(&root, m).await?;
+        u::check_complete(&root, m, id).await?;
     }
     ui::message("Starting World of Surf…", "")?;
     // The engine takes this same lock BEFORE loading plugins/progs. Drop ours before spawn;

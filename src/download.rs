@@ -9,6 +9,7 @@
 //! wherever the previous one stopped rather than starting over. Errors that retrying cannot
 //! fix (404/410) short-circuit the budget instead of consuming it.
 
+use crate::ftesurf_update::Identity;
 use crate::hashing::Hasher;
 use crate::manifest::FileEntry;
 use crate::ui::{self, Progress};
@@ -177,6 +178,7 @@ pub async fn download_all_quiet(
 /// FTESurf staging policy: preflight the whole batch before workers create files or
 /// contact object mirrors. Executable repair belongs solely to prepare_install.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn download_all_ftesurf(
     client: reqwest::Client,
     mirrors: Vec<String>,
@@ -185,8 +187,9 @@ pub async fn download_all_ftesurf(
     jobs: Vec<FileEntry>,
     total_bytes: u64,
     concurrency: usize,
+    id: Identity,
 ) -> Result<DlOutcome> {
-    download_ftesurf(client, mirrors, algo, install_dir, jobs, total_bytes, concurrency,
+    download_ftesurf(client, mirrors, algo, install_dir, jobs, total_bytes, concurrency, id,
         ui::Header::default(), Display::Quiet).await
 }
 
@@ -200,9 +203,10 @@ pub async fn download_all_ftesurf_with_ui(
     jobs: Vec<FileEntry>,
     total_bytes: u64,
     concurrency: usize,
+    id: Identity,
     header: ui::Header,
 ) -> Result<DlOutcome> {
-    download_ftesurf(client, mirrors, algo, install_dir, jobs, total_bytes, concurrency,
+    download_ftesurf(client, mirrors, algo, install_dir, jobs, total_bytes, concurrency, id,
         header, Display::WorldOfSurf).await
 }
 
@@ -215,6 +219,7 @@ async fn download_ftesurf(
     jobs: Vec<FileEntry>,
     total_bytes: u64,
     concurrency: usize,
+    id: Identity,
     header: ui::Header,
     display: Display,
 ) -> Result<DlOutcome> {
@@ -223,7 +228,7 @@ async fn download_ftesurf(
         "hardened staging opens unsupported on this platform".into()
     )));
     for entry in &jobs {
-        let dest = crate::ftesurf_update::checked_path(&install_dir, &entry.path)?;
+        let dest = crate::ftesurf_update::checked_path(&install_dir, &entry.path, id)?;
         DownloadPolicy::Ftesurf.check(&part_path(&dest), &dest)?;
     }
     download_all_inner(
@@ -753,6 +758,7 @@ mod tests {
             jobs,
             bytes,
             1,
+            Identity::Legacy,
         )
         .await
     }
@@ -1046,7 +1052,7 @@ mod tests {
                     "hash": blake2b_256(body), "exec": true}]
             }))
             .unwrap();
-            crate::ftesurf_update::prepare_install(&install, &m)
+            crate::ftesurf_update::prepare_install(&install, &m, Identity::Legacy)
                 .await
                 .unwrap();
             let installed_mode = std::fs::metadata(install.join("ftesurf64"))
