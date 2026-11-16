@@ -167,9 +167,12 @@ pub fn install_identity(root: &Path) -> Result<Identity> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Envelope {
+struct Envelope<'a> {
     payload: String,
-    signature: String,
+    /// Borrowed: serde_json cannot borrow a string with escapes, so the signature must be the raw
+    /// 128 characters, as the engine reads it.
+    #[serde(borrow)]
+    signature: &'a str,
 }
 
 /// Any JSON value, refusing an object that repeats a key: serde keeps the last, the engine's
@@ -292,12 +295,13 @@ pub fn decode(
 ) -> Result<Manifest> {
     ensure!(text.len() <= MAX_FEED, "update manifest is too large");
     unique_keys(text)?;
-    let raw: serde_json::Value = serde_json::from_str(text).context("signed update envelope")?;
+    // unique_keys parsed it, so the first non-blank byte says what it is
     ensure!(
-        raw.is_object(),
+        text.trim_start_matches([' ', '\t', '\n', '\r'])
+            .starts_with('{'),
         "signed update envelope is not a JSON object"
     );
-    let e: Envelope = serde_json::from_value(raw).context("signed update envelope")?;
+    let e: Envelope = serde_json::from_str(text).context("signed update envelope")?;
     ensure!(
         e.signature.len() == 128
             && e.signature
@@ -1394,6 +1398,13 @@ mod tests {
         assert!(
             decode(&short, &key, false, Identity::Legacy).is_err(),
             "127-digit signature"
+        );
+        // the same signature with one digit written as an escape
+        let escaped =
+            envelope.replace(sig, &format!("\\u00{:02x}{}", sig.as_bytes()[0], &sig[1..]));
+        assert!(
+            decode(&escaped, &key, false, Identity::Legacy).is_err(),
+            "escaped signature"
         );
     }
 
