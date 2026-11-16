@@ -46,7 +46,7 @@ impl Identity {
     fn exes(self) -> [&'static str; 2] {
         match self {
             Identity::Legacy => ["ftesurf64.exe", "ftesurf64"],
-            Identity::WorldOfSurf => ["WorldofSurf.exe", "worldofsurf"],
+            Identity::WorldOfSurf => ["WorldofSurf.exe", "worldofsurf64"],
         }
     }
     /// This platform's executable, the feed's exec cmd and a required file.
@@ -934,6 +934,7 @@ mod tests {
             assert!(!managed(new, Legacy) && !managed(old, WorldOfSurf));
         }
         for p in [
+            "worldofsurf",
             "worldofsurf.exe",
             "WORLDOFSURF/menu.dat",
             "WorldofSurf/menu.dat",
