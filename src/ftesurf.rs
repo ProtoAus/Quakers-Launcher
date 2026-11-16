@@ -38,8 +38,9 @@ struct Args {
     verify: bool,
     #[arg(long)]
     dry_run: bool,
-    #[arg(long, default_value = u::FEED_URL)]
-    manifest_url: String,
+    /// Default: the install identity's feed.
+    #[arg(long)]
+    manifest_url: Option<String>,
     /// Harness only: allow HTTP to localhost. Signatures are still mandatory.
     #[arg(long)]
     allow_insecure: bool,
@@ -83,8 +84,8 @@ async fn main() {
     }
 }
 
-async fn fetch(client: &reqwest::Client, args: &Args) -> Result<String> {
-    let url = reqwest::Url::parse(&args.manifest_url)?;
+async fn fetch(client: &reqwest::Client, args: &Args, url: &str) -> Result<String> {
+    let url = reqwest::Url::parse(url)?;
     ensure!(
         url.scheme() == "https"
             || (args.allow_insecure
@@ -114,6 +115,7 @@ async fn fetch(client: &reqwest::Client, args: &Args) -> Result<String> {
 }
 
 async fn run(a: &Args) -> Result<()> {
+    u::checked_game_args(&a.game_args)?;
     ui::welcome()?;
     let root = a.dir.clone().unwrap_or(
         std::env::current_exe()?
@@ -226,7 +228,13 @@ async fn run(a: &Args) -> Result<()> {
             .connect_timeout(Duration::from_secs(4))
             .timeout(Duration::from_secs(120))
             .build()?;
-        match fetch(&client, a).await {
+        match fetch(
+            &client,
+            a,
+            a.manifest_url.as_deref().unwrap_or(id.feed_url()),
+        )
+        .await
+        {
             Ok(envelope) => {
                 // Bad signatures/formats do NOT fall back and launch as if this were a network outage.
                 let m = u::decode(&envelope, u::PUBLIC_KEY, a.allow_insecure, id)?;

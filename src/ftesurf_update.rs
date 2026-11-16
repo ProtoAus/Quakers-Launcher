@@ -16,6 +16,10 @@ use std::{
 
 pub const PUBLIC_KEY: &str = "18c7c332f5bbc913a0fceef38eab9494ce79cf60771fdda093a2d5eabef86cb6";
 pub const FEED_URL: &str = "https://proto.bar/ftesurf/update.json";
+/// P1593: the worldofsurf feed, a sibling of FEED_URL; qkupdate.c's identity table names the same URL.
+pub const WOS_FEED_URL: &str = "https://proto.bar/ftesurf/worldofsurf.json";
+/// Each identity's required game files, at the root of its gamedir (feeds and install_identity).
+pub const GAME_REQUIRED: [&str; 3] = ["menu.dat", "csprogs.dat", "qwprogs.dat"];
 pub const META: &str = ".ftesurf-updater";
 pub const MAX_FEED: usize = 2 * 1024 * 1024;
 
@@ -53,25 +57,62 @@ impl Identity {
     pub fn exec(self) -> &'static str {
         self.exes()[usize::from(!cfg!(windows))]
     }
+    /// The signed feed this identity updates from (`--manifest-url` overrides it for harnesses).
+    pub fn feed_url(self) -> &'static str {
+        match self {
+            Identity::Legacy => FEED_URL,
+            Identity::WorldOfSurf => WOS_FEED_URL,
+        }
+    }
 }
 
-/// What an install with neither gamedir gets. Stays Legacy until a worldofsurf feed is published
-/// (stage 3 changes this together with FEED_URL).
+/// What an install with neither gamedir gets; the feed URL follows. Stays Legacy until a
+/// worldofsurf feed is published (stage 3 flips it).
 pub const FRESH_INSTALL: Identity = Identity::Legacy;
 
-/// The one identity rule (P1593): the gamedir on disk decides, and stage 2's folder move calls
-/// this again after moving. Anything at the name counts, links included (checked_path refuses
-/// those later); both present is a half-moved install and is refused, never guessed.
-pub fn install_identity(root: &Path) -> Result<Identity> {
-    let present = |id: Identity| -> Result<bool> {
-        let dir = id.gamedir().trim_end_matches('/');
-        match fs::symlink_metadata(root.join(dir)) {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(e).with_context(|| format!("cannot inspect {dir}/")),
+fn inspect(p: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(p) {
+        Ok(md) => Ok(Some(md)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("cannot inspect {}", p.display())),
+    }
+}
+
+fn is_link(md: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        md.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    md.file_type().is_symlink()
+}
+
+/// A gamedir counts when it is a real directory holding at least two GAME_REQUIRED files as
+/// regular files, no links. Two, not three: an update replaces one file at a time (recover()
+/// here, the engine's in-game apply), so an install interrupted there is short exactly one.
+pub fn gamedir_counts(root: &Path, id: Identity) -> Result<bool> {
+    let dir = root.join(id.gamedir().trim_end_matches('/'));
+    if !inspect(&dir)?.is_some_and(|md| md.is_dir() && !is_link(&md)) {
+        return Ok(false);
+    }
+    let mut have = 0;
+    for leaf in GAME_REQUIRED {
+        if inspect(&dir.join(leaf))?.is_some_and(|md| md.is_file() && !is_link(&md)) {
+            have += 1;
         }
-    };
-    match (present(Identity::Legacy)?, present(Identity::WorldOfSurf)?) {
+    }
+    Ok(have >= 2)
+}
+
+/// The one identity rule (P1593): the gamedir on disk decides, and stage 2's folder move calls
+/// this again after moving. Only a gamedir that counts (gamedir_counts) takes part, so a stray
+/// folder cannot lock the launcher out; both counting is a half-moved install and is refused.
+pub fn install_identity(root: &Path) -> Result<Identity> {
+    match (
+        gamedir_counts(root, Identity::Legacy)?,
+        gamedir_counts(root, Identity::WorldOfSurf)?,
+    ) {
         (true, true) => anyhow::bail!(
             "both ftesurf/ and worldofsurf/ exist here; refusing to guess which install this is"
         ),
@@ -87,6 +128,100 @@ struct Envelope {
     signature: String,
 }
 
+/// Any JSON value, refusing an object that repeats a key: serde keeps the last, the engine's
+/// reader the first, so a repeated "game" would be read two ways.
+struct UniqueKeys;
+
+impl<'de> Deserialize<'de> for UniqueKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        d.deserialize_any(UniqueKeysVisitor)
+    }
+}
+
+struct UniqueKeysVisitor;
+
+impl<'de> serde::de::Visitor<'de> for UniqueKeysVisitor {
+    type Value = UniqueKeys;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("JSON")
+    }
+    fn visit_bool<E>(self, _: bool) -> std::result::Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+    fn visit_i64<E>(self, _: i64) -> std::result::Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+    fn visit_u64<E>(self, _: u64) -> std::result::Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+    fn visit_f64<E>(self, _: f64) -> std::result::Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+    fn visit_str<E>(self, _: &str) -> std::result::Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+    fn visit_unit<E>(self) -> std::result::Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut a: A,
+    ) -> std::result::Result<UniqueKeys, A::Error> {
+        while a.next_element::<UniqueKeys>()?.is_some() {}
+        Ok(UniqueKeys)
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut a: A,
+    ) -> std::result::Result<UniqueKeys, A::Error> {
+        let mut seen = HashSet::new();
+        while let Some(k) = a.next_key::<String>()? {
+            if !seen.insert(k.clone()) {
+                return Err(serde::de::Error::custom(format!("duplicate key \"{k}\"")));
+            }
+            a.next_value::<UniqueKeys>()?;
+        }
+        Ok(UniqueKeys)
+    }
+}
+
+fn unique_keys(text: &str) -> Result<()> {
+    serde_json::from_str::<UniqueKeys>(text).context("signed update repeats a key")?;
+    Ok(())
+}
+
+/// Engine switches that choose the install's folders or manifest: -basegame/-game/+gamedir
+/// (fs.c FS_AppendManifestGameArguments, applied to -manifest's manifest too), -basedir,
+/// -homedir, -basepack, -manifest (cl_main.c), and the fs_game cvar (alias "game"). The
+/// launcher already chose all of them, so a passed-through game argument may not.
+const FOLDER_ARGS: [&str; 9] = [
+    "-basegame",
+    "-game",
+    "+gamedir",
+    "-basedir",
+    "-homedir",
+    "-basepack",
+    "-manifest",
+    "+fs_game",
+    "+game",
+];
+
+pub fn checked_game_args(args: &[String]) -> Result<()> {
+    for (i, a) in args.iter().enumerate() {
+        let set = ["+set", "+seta", "+sets", "+setu"]
+            .iter()
+            .any(|s| a.eq_ignore_ascii_case(s));
+        let target = args
+            .get(i + 1)
+            .is_some_and(|n| n.eq_ignore_ascii_case("fs_game") || n.eq_ignore_ascii_case("game"));
+        ensure!(
+            !FOLDER_ARGS.iter().any(|f| a.eq_ignore_ascii_case(f)) && !(set && target),
+            "game arguments may not choose the install's folders: {a}"
+        );
+    }
+    Ok(())
+}
+
 /// Verify the EXACT decoded UTF-8 payload bytes, never a reserialized JSON object.
 /// Public key is a parameter only for library tests; the shipped frontend pins PUBLIC_KEY.
 /// `id` is the install's identity: a feed for the other one is refused, never adopted.
@@ -97,6 +232,7 @@ pub fn decode(
     id: Identity,
 ) -> Result<Manifest> {
     ensure!(text.len() <= MAX_FEED, "update manifest is too large");
+    unique_keys(text)?;
     let e: Envelope = serde_json::from_str(text).context("signed update envelope")?;
     ensure!(!e.payload.contains('\0'), "NUL in update payload");
     let key: [u8; 32] = hex::decode(public_key)?
@@ -106,6 +242,7 @@ pub fn decode(
     VerifyingKey::from_bytes(&key)?
         .verify_strict(e.payload.as_bytes(), &sig)
         .context("update manifest signature is invalid")?;
+    unique_keys(&e.payload)?;
     let value: serde_json::Value = serde_json::from_str(&e.payload)?;
     ensure!(
         value["game"] == id.game(),
@@ -190,13 +327,11 @@ pub fn decode(
         e.cmd == id.exec() && e.args == ["-manifest", "default.fmf"],
         "unexpected launch command"
     );
-    for must in [
-        id.exec().to_string(),
-        "default.fmf".to_string(),
-        format!("{}menu.dat", id.gamedir()),
-        format!("{}csprogs.dat", id.gamedir()),
-        format!("{}qwprogs.dat", id.gamedir()),
-    ] {
+    let game = GAME_REQUIRED.map(|leaf| format!("{}{leaf}", id.gamedir()));
+    for must in [id.exec(), "default.fmf"]
+        .into_iter()
+        .chain(game.iter().map(String::as_str))
+    {
         ensure!(
             m.files_for_platform().any(|f| f.path == must),
             "missing required update file: {must}"
@@ -245,7 +380,7 @@ pub fn managed(p: &str, id: Identity) -> bool {
 /// a mistakenly authored release. No maps, Steam assets, identities, or arbitrary data.
 fn managed_legacy(p: &str) -> bool {
     if p.is_empty()
-        || !p.is_ascii()
+        || p.bytes().any(|c| c >= 0x7f)
         || p.len() >= 240
         || p.contains(['\\', ':', '"', '*', '<', '>', '?', '|'])
     {
@@ -765,9 +900,12 @@ mod tests {
     const HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
     fn signed(payload: &serde_json::Value) -> (String, String) {
+        signed_text(&payload.to_string())
+    }
+
+    fn signed_text(text: &str) -> (String, String) {
         use ed25519_dalek::{Signer, SigningKey};
         let key = SigningKey::from_bytes(&TEST_SEED);
-        let text = payload.to_string();
         let envelope = serde_json::json!({
             "payload": text,
             "signature": hex::encode(key.sign(text.as_bytes()).to_bytes()),
@@ -973,22 +1111,139 @@ mod tests {
         }
     }
 
+    fn game_files(dir: &Path, leaves: &[&str]) {
+        fs::create_dir_all(dir).unwrap();
+        for leaf in leaves {
+            fs::write(dir.join(leaf), leaf.as_bytes()).unwrap();
+        }
+    }
+
+    fn dir_link(target: &Path, link: &Path) {
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        #[cfg(not(windows))]
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
     #[test]
     fn install_identity_follows_the_gamedir_on_disk() {
         let r = Root::new("select");
         assert_eq!(install_identity(&r.0).unwrap(), FRESH_INSTALL);
         fs::create_dir(r.0.join("ftesurf")).unwrap();
+        assert_eq!(
+            install_identity(&r.0).unwrap(),
+            FRESH_INSTALL,
+            "empty gamedir"
+        );
+        game_files(&r.0.join("ftesurf"), &GAME_REQUIRED);
         assert_eq!(install_identity(&r.0).unwrap(), Identity::Legacy);
-        fs::write(r.0.join("worldofsurf"), b"anything at the name counts").unwrap();
+        // stray folders do not lock a legacy install out
+        fs::write(r.0.join("worldofsurf"), b"a file at the name").unwrap();
+        assert_eq!(
+            install_identity(&r.0).unwrap(),
+            Identity::Legacy,
+            "stray file"
+        );
+        fs::remove_file(r.0.join("worldofsurf")).unwrap();
+        game_files(&r.0.join("worldofsurf"), &["menu.dat"]);
+        assert_eq!(
+            install_identity(&r.0).unwrap(),
+            Identity::Legacy,
+            "stray folder, one file"
+        );
+        game_files(&r.0.join("worldofsurf"), &["csprogs.dat"]);
         assert!(
             install_identity(&r.0).is_err(),
             "half-moved install must not be guessed"
         );
-        fs::remove_dir(r.0.join("ftesurf")).unwrap();
+        fs::remove_dir_all(r.0.join("ftesurf")).unwrap();
         assert_eq!(install_identity(&r.0).unwrap(), Identity::WorldOfSurf);
         // paths of the other identity never reach the disk
         assert!(checked_path(&r.0, "ftesurf/menu.dat", Identity::WorldOfSurf).is_err());
         assert!(checked_path(&r.0, "worldofsurf/menu.dat", Identity::Legacy).is_err());
         assert!(checked_path(&r.0, ".ftesurf-updater/state.json", Identity::WorldOfSurf).is_ok());
+    }
+
+    #[test]
+    fn an_update_interrupted_mid_replacement_keeps_its_identity() {
+        // recover() renames the live file aside before the staged one in: one required file absent
+        let r = Root::new("midupdate");
+        game_files(&r.0.join("worldofsurf"), &["csprogs.dat", "qwprogs.dat"]);
+        assert_eq!(install_identity(&r.0).unwrap(), Identity::WorldOfSurf);
+    }
+
+    #[test]
+    fn linked_gamedirs_and_files_do_not_count() {
+        let r = Root::new("links");
+        let elsewhere = r.0.join("elsewhere");
+        game_files(&elsewhere, &GAME_REQUIRED);
+        dir_link(&elsewhere, &r.0.join("worldofsurf"));
+        game_files(&r.0.join("ftesurf"), &GAME_REQUIRED);
+        assert_eq!(
+            install_identity(&r.0).unwrap(),
+            Identity::Legacy,
+            "linked gamedir"
+        );
+        fs::remove_dir_all(r.0.join("ftesurf")).unwrap();
+        assert_eq!(install_identity(&r.0).unwrap(), FRESH_INSTALL);
+    }
+
+    #[test]
+    fn game_arguments_may_not_choose_folders() {
+        let ok: Vec<String> = ["-window", "+map", "surf_utopia", "+set", "sensitivity", "2"]
+            .map(String::from)
+            .to_vec();
+        assert!(checked_game_args(&ok).is_ok());
+        for bad in [
+            &["-basegame", "ftesurf"][..],
+            &["-GAME", "x"],
+            &["+gamedir", "x"],
+            &["-basedir", "C:/"],
+            &["-homedir", "x"],
+            &["-basepack", "x"],
+            &["-manifest", "other.fmf"],
+            &["+fs_game", "x"],
+            &["+game", "x"],
+            &["+set", "fs_game", "x"],
+            &["+seta", "GAME", "x"],
+        ] {
+            let args: Vec<String> = bad.iter().map(|a| a.to_string()).collect();
+            assert!(checked_game_args(&args).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn each_identity_has_its_own_feed() {
+        assert_eq!(Identity::Legacy.feed_url(), FEED_URL);
+        assert_eq!(
+            Identity::WorldOfSurf.feed_url(),
+            "https://proto.bar/ftesurf/worldofsurf.json"
+        );
+    }
+
+    #[test]
+    fn repeated_keys_are_refused() {
+        // serde keeps the last "game": a legacy feed that also says worldofsurf first
+        let text = feed_for(Identity::Legacy).to_string();
+        let doubled = format!("{{\"game\":\"worldofsurf\",{}", &text[1..]);
+        let (envelope, key) = signed_text(&doubled);
+        assert!(decode(&envelope, &key, false, Identity::Legacy).is_err());
+        let nested = text.replacen("\"path\":", "\"path\":\"ftesurf/gfx/x.png\",\"path\":", 1);
+        let (envelope, key) = signed_text(&nested);
+        assert!(decode(&envelope, &key, false, Identity::Legacy).is_err());
+    }
+
+    #[test]
+    fn delete_byte_is_refused_in_paths() {
+        assert!(!managed("ftesurf/gfx/a\x7f.png", Identity::Legacy));
+        assert!(!managed("worldofsurf/gfx/a\x7f.png", Identity::WorldOfSurf));
+        assert!(managed("ftesurf/gfx/a~.png", Identity::Legacy));
     }
 }
