@@ -219,9 +219,11 @@ impl<'de> serde::de::Visitor<'de> for UniqueKeysVisitor {
         mut a: A,
     ) -> std::result::Result<UniqueKeys, A::Error> {
         let mut seen = HashSet::new();
-        while let Some(k) = a.next_key::<String>()? {
+        // A borrowed key has no escapes: serde_json refuses to borrow one that has, as the engine
+        // (which compares raw names) refuses it.
+        while let Some(k) = a.next_key::<&'de str>()? {
             // JSON_FindChild also lets "name." match "name"
-            if k.contains('.') || !seen.insert(k.clone()) {
+            if k.contains('.') || !seen.insert(k) {
                 return Err(serde::de::Error::custom(format!(
                     "repeated or dotted key \"{k}\""
                 )));
@@ -290,7 +292,19 @@ pub fn decode(
 ) -> Result<Manifest> {
     ensure!(text.len() <= MAX_FEED, "update manifest is too large");
     unique_keys(text)?;
-    let e: Envelope = serde_json::from_str(text).context("signed update envelope")?;
+    let raw: serde_json::Value = serde_json::from_str(text).context("signed update envelope")?;
+    ensure!(
+        raw.is_object(),
+        "signed update envelope is not a JSON object"
+    );
+    let e: Envelope = serde_json::from_value(raw).context("signed update envelope")?;
+    ensure!(
+        e.signature.len() == 128
+            && e.signature
+                .bytes()
+                .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')),
+        "update signature must be 128 lowercase hex digits"
+    );
     ensure!(!e.payload.contains('\0'), "NUL in update payload");
     let key: [u8; 32] = hex::decode(public_key)?
         .try_into()
@@ -1344,6 +1358,43 @@ mod tests {
         fs::create_dir(&elsewhere).unwrap();
         dir_link(&elsewhere, &r.0.join(".ftesurf-updater").join("identity")); // mklink wants backslashes
         assert!(install_identity(&r.0).is_err(), "a linked marker");
+    }
+
+    #[test]
+    fn envelope_shape_matches_the_engine() {
+        let text = feed_for(Identity::Legacy).to_string();
+        let (envelope, key) = signed_text(&text);
+        assert!(decode(&envelope, &key, false, Identity::Legacy).is_ok());
+        // an escaped key name, in the payload and in the envelope
+        let (escaped, key2) = signed_text(&text.replacen("\"schema\"", "\"sch\\u0065ma\"", 1));
+        assert!(
+            decode(&escaped, &key2, false, Identity::Legacy).is_err(),
+            "escaped payload key"
+        );
+        let env_escaped = envelope.replacen("\"payload\"", "\"pay\\u006coad\"", 1);
+        assert!(
+            decode(&env_escaped, &key, false, Identity::Legacy).is_err(),
+            "escaped envelope key"
+        );
+        // the envelope as an array (serde would map it onto the struct)
+        let v: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+        let array = serde_json::json!([v["payload"], v["signature"]]).to_string();
+        assert!(
+            decode(&array, &key, false, Identity::Legacy).is_err(),
+            "array envelope"
+        );
+        // the signature in upper case, and one hex digit short
+        let sig = v["signature"].as_str().unwrap();
+        let upper = envelope.replace(sig, &sig.to_ascii_uppercase());
+        assert!(
+            decode(&upper, &key, false, Identity::Legacy).is_err(),
+            "upper-case signature"
+        );
+        let short = envelope.replace(sig, &sig[1..]);
+        assert!(
+            decode(&short, &key, false, Identity::Legacy).is_err(),
+            "127-digit signature"
+        );
     }
 
     #[test]
