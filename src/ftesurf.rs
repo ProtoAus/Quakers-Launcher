@@ -319,6 +319,7 @@ async fn run(a: &Args) -> Result<()> {
                     u::write_meta(&root, "installed.json", envelope.as_bytes(), id)?;
                 }
                 u::check_complete(&root, &m, id).await?;
+                u::establish_identity(&root, id)?; // P1593: the first verified install records it
                 if ingame_pending {
                     // The fetched signed feed, not untrusted old journal entries, determines
                     // every repair. Preserve the old journal only after the full set verifies.

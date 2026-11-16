@@ -105,10 +105,53 @@ pub fn gamedir_counts(root: &Path, id: Identity) -> Result<bool> {
     Ok(have >= 2)
 }
 
-/// The one identity rule (P1593): the gamedir on disk decides, and stage 2's folder move calls
-/// this again after moving. Only a gamedir that counts (gamedir_counts) takes part, so a stray
-/// folder cannot lock the launcher out; both counting is a half-moved install and is refused.
+/// The launcher's durable identity record, outside both gamedirs; qkupdate.c reads it too.
+pub const MARKER: &str = ".ftesurf-updater/identity";
+
+/// None when absent. Anything but a regular file holding one identity word and an optional
+/// newline is an error: a damaged marker is refused, never guessed past.
+pub fn read_marker(root: &Path) -> Result<Option<Identity>> {
+    let p = checked_path(root, MARKER, FRESH_INSTALL)?;
+    let Some(md) = inspect(&p)? else {
+        return Ok(None);
+    };
+    ensure!(
+        md.is_file() && !is_link(&md) && md.len() <= 64,
+        "install identity marker is not a regular file: {MARKER}"
+    );
+    let text = fs::read(&p)?;
+    let word = text.strip_suffix(b"\n").unwrap_or(&text);
+    [Identity::Legacy, Identity::WorldOfSurf]
+        .into_iter()
+        .find(|id| id.game().as_bytes() == word)
+        .map(Some)
+        .with_context(|| format!("damaged install identity marker: {MARKER}"))
+}
+
+/// Record `id` once an install is verified under it (fresh install or first verified update;
+/// stage 2's folder move rewrites it). Call under the install lock.
+pub fn establish_identity(root: &Path, id: Identity) -> Result<()> {
+    match read_marker(root)? {
+        Some(have) => {
+            ensure!(
+                have == id,
+                "install identity marker says {}, not {}",
+                have.game(),
+                id.game()
+            );
+            Ok(())
+        }
+        None => write_meta(root, "identity", format!("{}\n", id.game()).as_bytes(), id),
+    }
+}
+
+/// The one identity rule (P1593): the marker when there is one; otherwise the gamedir on disk.
+/// Only a gamedir that counts (gamedir_counts) takes part, so a stray folder cannot lock the
+/// launcher out; both counting is a half-moved install and is refused.
 pub fn install_identity(root: &Path) -> Result<Identity> {
+    if let Some(id) = read_marker(root)? {
+        return Ok(id);
+    }
     match (
         gamedir_counts(root, Identity::Legacy)?,
         gamedir_counts(root, Identity::WorldOfSurf)?,
@@ -123,6 +166,7 @@ pub fn install_identity(root: &Path) -> Result<Identity> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Envelope {
     payload: String,
     signature: String,
@@ -176,8 +220,11 @@ impl<'de> serde::de::Visitor<'de> for UniqueKeysVisitor {
     ) -> std::result::Result<UniqueKeys, A::Error> {
         let mut seen = HashSet::new();
         while let Some(k) = a.next_key::<String>()? {
-            if !seen.insert(k.clone()) {
-                return Err(serde::de::Error::custom(format!("duplicate key \"{k}\"")));
+            // JSON_FindChild also lets "name." match "name"
+            if k.contains('.') || !seen.insert(k.clone()) {
+                return Err(serde::de::Error::custom(format!(
+                    "repeated or dotted key \"{k}\""
+                )));
             }
             a.next_value::<UniqueKeys>()?;
         }
@@ -190,34 +237,44 @@ fn unique_keys(text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Engine switches that choose the install's folders or manifest: -basegame/-game/+gamedir
-/// (fs.c FS_AppendManifestGameArguments, applied to -manifest's manifest too), -basedir,
-/// -homedir, -basepack, -manifest (cl_main.c), and the fs_game cvar (alias "game"). The
-/// launcher already chose all of them, so a passed-through game argument may not.
-const FOLDER_ARGS: [&str; 9] = [
-    "-basegame",
-    "-game",
-    "+gamedir",
-    "-basedir",
-    "-homedir",
-    "-basepack",
-    "-manifest",
-    "+fs_game",
-    "+game",
-];
-
+/// Game arguments after `--`, an allowlist (P1593): what the docs (`-- -window +map <map>`) and
+/// ftesurf.sh (`<map>`, `--debug`) pass. Windows re-splits a command line on quotes and
+/// whitespace, so no element may hold either; a value never starts with `-` or `+`, since the
+/// engine scans every position for its switches (-basegame, -basedir, ...).
 pub fn checked_game_args(args: &[String]) -> Result<()> {
-    for (i, a) in args.iter().enumerate() {
-        let set = ["+set", "+seta", "+sets", "+setu"]
+    ensure!(
+        !args
             .iter()
-            .any(|s| a.eq_ignore_ascii_case(s));
-        let target = args
-            .get(i + 1)
-            .is_some_and(|n| n.eq_ignore_ascii_case("fs_game") || n.eq_ignore_ascii_case("game"));
-        ensure!(
-            !FOLDER_ARGS.iter().any(|f| a.eq_ignore_ascii_case(f)) && !(set && target),
-            "game arguments may not choose the install's folders: {a}"
-        );
+            .any(|a| a.contains('"') || a.chars().any(char::is_whitespace)),
+        "game arguments may not contain quotes or whitespace"
+    );
+    let value = |v: Option<&String>| {
+        v.is_some_and(|v| {
+            v.len() <= 64
+                && v.bytes()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_')
+                && v.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"_.:-".contains(&c))
+        })
+    };
+    let number = |v: Option<&String>| {
+        v.is_some_and(|v| (1..=5).contains(&v.len()) && v.bytes().all(|c| c.is_ascii_digit()))
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let (next, after) = (args.get(i + 1), args.get(i + 2).map(String::as_str));
+        i += match args[i].as_str() {
+            "-window" | "-fullscreen" | "-condebug" => 1,
+            "+map" | "+connect" if value(next) => 2,
+            "-width" | "-height" if number(next) => 2,
+            "+set" if next.is_some_and(|n| n == "log_dir") && after == Some("logs") => 3,
+            "+set" if next.is_some_and(|n| n == "developer") && after == Some("1") => 3,
+            a => anyhow::bail!(
+                "game argument not allowed: {a} (allowed: +map <map>, +connect <host[:port]>, \
+                 -window, -fullscreen, -width N, -height N)"
+            ),
+        };
     }
     Ok(())
 }
@@ -249,6 +306,7 @@ pub fn decode(
         "not an update for this install (expected game \"{}\")",
         id.game()
     );
+    let removed_empty = value["removed"].as_array().is_some_and(|r| r.is_empty());
     let m: Manifest = serde_json::from_value(value)?;
     ensure!(
         m.schema == 2 && m.hash_algo == "blake2b-256",
@@ -260,8 +318,8 @@ pub fn decode(
         "unsupported channel/layout"
     );
     ensure!(
-        m.removed.is_empty(),
-        "this updater does not delete retired files"
+        removed_empty,
+        "this updater needs an empty \"removed\" list (it does not delete retired files)"
     );
     ensure!(!m.mirrors.is_empty(), "update has no object mirror");
     for mirror in &m.mirrors {
@@ -1195,28 +1253,125 @@ mod tests {
         assert_eq!(install_identity(&r.0).unwrap(), FRESH_INSTALL);
     }
 
+    fn strings(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn game_arguments_may_not_choose_folders() {
-        let ok: Vec<String> = ["-window", "+map", "surf_utopia", "+set", "sensitivity", "2"]
-            .map(String::from)
-            .to_vec();
-        assert!(checked_game_args(&ok).is_ok());
+    fn game_arguments_are_an_allowlist() {
+        for ok in [
+            &["-window", "+map", "surf_utopia"][..],
+            &["+connect", "play.proto.bar:27500", "-fullscreen"],
+            &["-width", "1920", "-height", "1080"],
+            &[
+                "-condebug",
+                "+set",
+                "log_dir",
+                "logs",
+                "+set",
+                "developer",
+                "1",
+                "+map",
+                "surf_x",
+            ],
+            &[],
+        ] {
+            assert!(checked_game_args(&strings(ok)).is_ok(), "{ok:?}");
+        }
         for bad in [
             &["-basegame", "ftesurf"][..],
-            &["-GAME", "x"],
-            &["+gamedir", "x"],
-            &["-basedir", "C:/"],
-            &["-homedir", "x"],
-            &["-basepack", "x"],
-            &["-manifest", "other.fmf"],
-            &["+fs_game", "x"],
-            &["+game", "x"],
-            &["+set", "fs_game", "x"],
-            &["+seta", "GAME", "x"],
+            &["+set", "sensitivity", "2"],
+            &["+exec", "x.cfg"],
+            &["+map", "surf x"],
+            &["+map", "surf\tx"],
+            &["+map", "a\"b"],
+            &["+map", "-basegame"],
+            &["+connect", "+gamedir"],
+            &["+map", "../x"],
+            &["+map"],
+            &["-width", "wide"],
+            &["+set", "developer", "2"],
+            &["+MAP", "surf_x"],
+            &["-window", "+gamedir", "x"],
         ] {
-            let args: Vec<String> = bad.iter().map(|a| a.to_string()).collect();
-            assert!(checked_game_args(&args).is_err(), "{bad:?}");
+            assert!(checked_game_args(&strings(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_marker_names_the_identity_first() {
+        let r = Root::new("marker");
+        game_files(&r.0.join("ftesurf"), &GAME_REQUIRED);
+        establish_identity(&r.0, Identity::WorldOfSurf).unwrap();
+        assert_eq!(fs::read(r.0.join(MARKER)).unwrap(), b"worldofsurf\n");
+        assert_eq!(
+            install_identity(&r.0).unwrap(),
+            Identity::WorldOfSurf,
+            "marker over files"
+        );
+        game_files(&r.0.join("worldofsurf"), &GAME_REQUIRED);
+        assert_eq!(
+            install_identity(&r.0).unwrap(),
+            Identity::WorldOfSurf,
+            "marker over half-moved"
+        );
+        assert!(
+            establish_identity(&r.0, Identity::Legacy).is_err(),
+            "marker is not rewritten"
+        );
+        fs::write(r.0.join(MARKER), b"ftesurf").unwrap();
+        assert_eq!(
+            install_identity(&r.0).unwrap(),
+            Identity::Legacy,
+            "no trailing newline"
+        );
+        for bad in [
+            &b"WorldofSurf\n"[..],
+            b"worldofsurf\r\n",
+            b"worldofsurf\n\n",
+            b" ftesurf",
+            b"",
+            b"quakers\n",
+        ] {
+            fs::write(r.0.join(MARKER), bad).unwrap();
+            assert!(install_identity(&r.0).is_err(), "{bad:?}");
+        }
+        fs::remove_file(r.0.join(MARKER)).unwrap();
+        fs::create_dir(r.0.join(MARKER)).unwrap();
+        assert!(install_identity(&r.0).is_err(), "a directory is no marker");
+        fs::remove_dir(r.0.join(MARKER)).unwrap();
+        let elsewhere = r.0.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        dir_link(&elsewhere, &r.0.join(".ftesurf-updater").join("identity")); // mklink wants backslashes
+        assert!(install_identity(&r.0).is_err(), "a linked marker");
+    }
+
+    #[test]
+    fn removed_must_be_present_and_empty() {
+        let mut absent = feed_for(Identity::Legacy);
+        absent.as_object_mut().unwrap().remove("removed");
+        assert!(!accepts(&absent, Identity::Legacy));
+        let mut listed = feed_for(Identity::Legacy);
+        listed["removed"] = serde_json::json!(["ftesurf/gfx/old.png"]);
+        assert!(!accepts(&listed, Identity::Legacy));
+    }
+
+    #[test]
+    fn dotted_and_extra_envelope_keys_are_refused() {
+        let text = feed_for(Identity::Legacy).to_string();
+        let (envelope, key) = signed_text(&format!("{{\"game.\":\"worldofsurf\",{}", &text[1..]));
+        assert!(
+            decode(&envelope, &key, false, Identity::Legacy).is_err(),
+            "dotted key"
+        );
+        let (envelope, key) = signed_text(&text);
+        let mut extra: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+        extra["note"] = "x".into();
+        assert!(
+            decode(&extra.to_string(), &key, false, Identity::Legacy).is_err(),
+            "extra envelope key"
+        );
+        assert!(decode(&envelope, &key, false, Identity::Legacy).is_ok());
     }
 
     #[test]
