@@ -837,12 +837,25 @@ mod tests {
         let here = crate::manifest::platform_key();
         let mut relabelled = feed_for(WorldOfSurf);
         relabelled["game"] = "ftesurf".into();
+        // only the game check refuses these two: the contents fit the install
+        let mut legacy_as_new = feed_for(Legacy);
+        legacy_as_new["game"] = "worldofsurf".into();
         let mut legacy_exec = feed_for(WorldOfSurf);
         legacy_exec["exec_by_platform"][here]["cmd"] = Legacy.exec().into();
         let mut unknown = feed_for(WorldOfSurf);
         unknown["game"] = "WorldofSurf".into();
         let cases = [
-            ("relabelled", relabelled, Legacy),
+            ("relabelled", relabelled.clone(), Legacy),
+            (
+                "worldofsurf contents labelled ftesurf",
+                relabelled,
+                WorldOfSurf,
+            ),
+            (
+                "ftesurf contents labelled worldofsurf",
+                legacy_as_new,
+                Legacy,
+            ),
             (
                 "legacy gamedir in a new feed",
                 with_file(feed_for(WorldOfSurf), "ftesurf/gfx/x.png", "all"),
