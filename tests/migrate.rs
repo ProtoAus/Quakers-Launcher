@@ -949,8 +949,16 @@ async fn a_link_at_the_cfg_temp_name_is_never_written_through() {
     let i = Install::legacy("tmplink", true);
     let victim = i.root.join("victim");
     put(&victim.join("keep.txt"), b"victim");
+    // a file symlink where Windows allows one (developer mode), else a junction
     #[cfg(windows)]
-    dir_link(&victim, &i.root.join("ftesurf/ftesurf.cfg.move-tmp"));
+    if std::os::windows::fs::symlink_file(
+        victim.join("keep.txt"),
+        i.root.join("ftesurf/ftesurf.cfg.move-tmp"),
+    )
+    .is_err()
+    {
+        dir_link(&victim, &i.root.join("ftesurf/ftesurf.cfg.move-tmp"));
+    }
     #[cfg(not(windows))]
     std::os::unix::fs::symlink(
         victim.join("keep.txt"),
@@ -967,7 +975,12 @@ async fn a_link_at_the_cfg_temp_name_is_never_written_through() {
         "the move waits, blocked, for the link to go"
     );
     #[cfg(windows)]
-    fs::remove_dir(i.root.join("worldofsurf/ftesurf.cfg.move-tmp")).unwrap();
+    {
+        let link = i.root.join("worldofsurf/ftesurf.cfg.move-tmp");
+        fs::remove_file(&link)
+            .or_else(|_| fs::remove_dir(&link))
+            .unwrap();
+    }
     #[cfg(not(windows))]
     fs::remove_file(i.root.join("worldofsurf/ftesurf.cfg.move-tmp")).unwrap();
     next_start(&i, &wos("ftesurf")).await.unwrap();
