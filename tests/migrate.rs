@@ -944,7 +944,8 @@ async fn only_the_signed_default_fmf_names_the_cfg() {
     }
     put(
         &staging.join("default.fmf"),
-        b"FTEMANIFEST 1\nGAME \"WorldofSurf\"\nBASEGAME \"worldofsurf\"\nMAINCONFIG worldofsurf\n",
+        // valid in every line, so only the signed hash refuses it
+        b"FTEMANIFEST 1\nGAME \"WorldofSurf\"\nBASEGAME \"worldofsurf\"\nDISABLEHOMEDIR 1\nMAINCONFIG worldofsurf\n",
     );
     assert!(migrate::before_install(&lock, &staging, &m, &jobs)
         .await

@@ -1029,6 +1029,10 @@ mod tests {
             ("MAINCONFIG ftesurf\n*game x\n", None),
             ("MAINCONFIG ftesurf\n*\n", None),
             ("MAINCONFIG ftesurf /* worldofsurf */\n", None),
+            // on a line nothing else reads, only the character checks refuse these
+            ("MAINCONFIG ftesurf\nNAME x /* y */\n", None),
+            ("MAINCONFIG ftesurf\nNAME x\r\n", None),
+            ("MAINCONFIG ftesurf\nNAME x\x7f\n", None),
             ("MAINCONFIG ftesurf\r\n", None),
             ("MAINCONFIG ftesurf\n-set a\\b 1\n", None),
             ("MAINCONFIG ftesurf\nNAME \"\"\n", None),
