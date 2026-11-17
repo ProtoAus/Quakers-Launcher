@@ -51,6 +51,17 @@ fn put(path: &Path, bytes: &[u8]) {
     fs::write(path, bytes).unwrap();
 }
 
+/// An installed engine as the launcher leaves it on unix (0755), so parking has a bit to clear.
+fn executable(p: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = p;
+}
+
 fn dir_link(target: &Path, link: &Path) {
     #[cfg(windows)]
     assert!(std::process::Command::new("cmd")
@@ -107,6 +118,7 @@ impl Install {
         put(&r.join("ftesurf/data/runs/surf_a.rec"), b"a recorded run");
         put(&r.join("ftesurf/maps/surf_a.bsp"), b"a downloaded map");
         put(&r.join(Identity::Legacy.exec()), LEGACY_EXE);
+        executable(&r.join(Identity::Legacy.exec()));
         put(&r.join("default.fmf"), LEGACY_FMF);
         for (name, bytes) in IDENTITY_FILES {
             put(&r.join(name), bytes);
@@ -1260,6 +1272,7 @@ async fn legacy_exes_are_parked_and_only_the_known_ones_deleted() {
     // a shared install: both platforms' legacy exes, both in the ledger
     let i = Install::legacy("shared", true);
     put(&i.root.join(other), b"other legacy engine");
+    executable(&i.root.join(other));
     let mut st: serde_json::Value =
         serde_json::from_slice(&i.read(".ftesurf-updater/state.json").unwrap()).unwrap();
     st["files"][other] = blake(b"other legacy engine").into();
