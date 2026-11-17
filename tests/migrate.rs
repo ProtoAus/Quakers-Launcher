@@ -215,7 +215,7 @@ fn feed(id: Identity, version: &str, mainconfig: &str, seed: [u8; 32]) -> Feed {
     let fmf = match id {
         Identity::Legacy => LEGACY_FMF.to_vec(),
         Identity::WorldOfSurf => format!(
-            "FTEMANIFEST 1\nGAME \"WorldofSurf\"\nBASEGAME \"worldofsurf\"\nMAINCONFIG {mainconfig}\n"
+            "FTEMANIFEST 1\nGAME \"WorldofSurf\"\nBASEGAME \"worldofsurf\"\nDISABLEHOMEDIR 1\nMAINCONFIG {mainconfig}\n"
         )
         .into_bytes(),
     };
@@ -312,12 +312,47 @@ enum Stop {
     InFinish(Point),
 }
 
-/// The launcher's update path after its fetch (ftesurf.rs run()): plan, stage what the download
-/// would, before_install, begin + recover (or adopt), check_complete, finish, establish_identity.
+fn key() -> String {
+    wos("ftesurf").key
+}
+
+/// migrate::start with the default feed, as the launcher calls it after the player approved it.
+fn start(lock: &InstallLock) -> Result<()> {
+    start_feed(lock, &wos("ftesurf"))
+}
+
+fn start_feed(lock: &InstallLock, f: &Feed) -> Result<()> {
+    migrate::start(lock, &f.envelope, &f.key, false)
+}
+
+fn start_with(lock: &InstallLock, hook: &mut dyn FnMut(Point) -> Result<()>) -> Result<()> {
+    let f = wos("ftesurf");
+    migrate::start_with(lock, &f.envelope, &f.key, false, hook)
+}
+
+fn resume(lock: &InstallLock) -> Result<bool> {
+    migrate::resume(lock, &key(), false)
+}
+
+/// The launcher's update path (ftesurf.rs run() and install_feed): while the move waits for its
+/// update, the approved feed from FEED, else the fetched one; plan, stage what the download would,
+/// before_install, begin + recover (or adopt), check_complete, finish, establish_identity.
 async fn update(lock: &InstallLock, f: &Feed, id: Identity, stop: Stop) -> Result<()> {
     let root = lock.root();
     let moving = migrate::read_journal(root)?.is_some();
-    let m = u::decode(&f.envelope, &f.key, false, id)?;
+    let (envelope, m) = if moving && migrate::awaits_update(root)? {
+        migrate::approved_feed(root, &f.key, false)?
+    } else {
+        (
+            f.envelope.clone(),
+            u::decode(&f.envelope, &f.key, false, id)?,
+        )
+    };
+    let f = &Feed {
+        envelope,
+        key: f.key.clone(),
+        contents: f.contents.clone(),
+    };
     let old = u::load_state(root, id)?;
     let (jobs, _kept) = u::plan(&m, root, &old, id).await?;
     let staging = root.join(".ftesurf-updater/download");
@@ -373,23 +408,28 @@ async fn move_install(lock: &InstallLock, f: &Feed) -> Result<Vec<String>> {
         put(&staging.join(&j.path), &f.contents[&j.path]);
     }
     migrate::check_feed(root, &staging, &m, &jobs).await?;
-    migrate::start(lock)?;
+    migrate::start(lock, &f.envelope, &f.key, false)?;
     let mut staged: Vec<_> = jobs.into_iter().map(|j| j.path).collect();
     staged.sort();
     Ok(staged)
 }
 
-/// The next launcher start: resume, recover, then the update.
-async fn next_start(i: &Install, f: &Feed) -> Result<()> {
+/// The next launcher start the player makes: resume (or, for an intent that never started, the
+/// launcher asks again and starts), recover, then the update. True when it resumed.
+async fn next_start(i: &Install, f: &Feed) -> Result<bool> {
     let lock = i.lock();
-    assert!(migrate::resume(&lock)?, "a journalled move is resumed");
+    let resumed = resume(&lock)?;
+    if !resumed {
+        assert_eq!(u::install_identity(&i.root)?, Identity::Legacy);
+        start_feed(&lock, f)?;
+    }
     let id = u::install_identity(&i.root)?;
     assert_eq!(id, Identity::WorldOfSurf);
     u::recover_with_key(&i.root, &f.key, false, id).await?;
     if migrate::read_journal(&i.root)?.is_some() {
         update(&lock, f, id, Stop::No).await?;
     }
-    Ok(())
+    Ok(resumed)
 }
 
 fn assert_moved(i: &Install, cfg_name: &str) {
@@ -434,6 +474,10 @@ fn assert_moved(i: &Install, cfg_name: &str) {
     assert_eq!(i.read(u::MARKER).unwrap(), b"worldofsurf\n");
     assert!(i.read(".ftesurf-updater/pending.json").is_none());
     assert!(i.read(migrate::JOURNAL).is_none());
+    assert!(
+        i.read(migrate::FEED).is_none(),
+        "the approved feed goes with the journal"
+    );
     let st = u::load_state(r, Identity::WorldOfSurf).unwrap();
     assert_eq!(st.version, "0.1.49");
     assert!(
@@ -492,7 +536,7 @@ async fn every_crash_point_resumes_to_the_same_install() {
     let reference = {
         let i = Install::legacy("ref", true);
         let lock = i.lock();
-        migrate::start(&lock).unwrap();
+        start(&lock).unwrap();
         update(&lock, &f, Identity::WorldOfSurf, Stop::No)
             .await
             .unwrap();
@@ -513,7 +557,7 @@ async fn every_crash_point_resumes_to_the_same_install() {
         let i = Install::legacy(&format!("crash{n}"), true);
         {
             let lock = i.lock();
-            let e = migrate::start_with(&lock, &mut stop_at(stop)).unwrap_err();
+            let e = start_with(&lock, &mut stop_at(stop)).unwrap_err();
             assert!(e.to_string().contains("simulated crash"), "{stop:?}: {e:#}");
         }
         // never startable as if complete: the barrier blocks every engine, or nothing moved yet
@@ -527,7 +571,12 @@ async fn every_crash_point_resumes_to_the_same_install() {
             untouched || i.read(Identity::Legacy.exec()).is_none(),
             "{stop:?}: the legacy exe leaves the root with the folder"
         );
-        next_start(&i, &f).await.unwrap();
+        // only an intent without its barrier never started; the launcher then asks again
+        assert_eq!(
+            next_start(&i, &f).await.unwrap(),
+            stop != Point::Recorded(Step::Intent),
+            "{stop:?}"
+        );
         assert_eq!(i.snapshot(), reference, "{stop:?}");
         assert_moved(&i, "ftesurf.cfg");
     }
@@ -542,26 +591,28 @@ async fn every_crash_point_resumes_to_the_same_install() {
         let i = Install::legacy(&format!("crash-update{n}"), true);
         {
             let lock = i.lock();
-            migrate::start(&lock).unwrap();
+            start(&lock).unwrap();
             assert!(update(&lock, &f, Identity::WorldOfSurf, stop)
                 .await
                 .is_err());
         }
-        next_start(&i, &f).await.unwrap();
+        assert!(next_start(&i, &f).await.unwrap());
         assert_eq!(i.snapshot(), reference, "update crash {n}");
     }
 }
 
 #[tokio::test]
 async fn a_rename_interrupted_before_its_record_is_recognised() {
-    // the rename happened, the journal still says intent and no barrier was written
+    // the rename happened, the journal still says intent, and the barrier has gone since: the
+    // move is carried forward, never abandoned (only an unmoved intent is)
     let i = Install::legacy("gap", true);
-    put(
-        &i.root.join(migrate::JOURNAL),
-        br#"{"schema":1,"from":"ftesurf","to":"worldofsurf","step":"intent"}"#,
-    );
-    fs::rename(i.root.join("ftesurf"), i.root.join("worldofsurf")).unwrap();
-    next_start(&i, &wos("ftesurf")).await.unwrap();
+    {
+        let lock = i.lock();
+        assert!(start_with(&lock, &mut stop_at(Point::Done(Step::Renamed))).is_err());
+    }
+    fs::remove_file(i.root.join(".ftesurf-updater/pending.json")).unwrap();
+    assert_eq!(migrate::read_journal(&i.root).unwrap(), Some(Step::Intent));
+    assert!(next_start(&i, &wos("ftesurf")).await.unwrap(), "resumed");
     assert_moved(&i, "ftesurf.cfg");
 }
 
@@ -598,6 +649,13 @@ async fn refusals_change_nothing() {
             fs::create_dir(r.join("elsewhere")).unwrap();
             dir_link(&r.join("elsewhere"), &r.join(Identity::Legacy.exec()));
         }),
+        ("the parked folder is a link", |r| {
+            fs::create_dir(r.join("elsewhere")).unwrap();
+            dir_link(&r.join("elsewhere"), &r.join(".ftesurf-updater/legacy"));
+        }),
+        ("the parked folder is a file", |r| {
+            put(&r.join(".ftesurf-updater/legacy"), b"x")
+        }),
         ("an unfinished update", |r| {
             put(&r.join(".ftesurf-updater/pending.json"), b"{}")
         }),
@@ -621,7 +679,7 @@ async fn refusals_change_nothing() {
             migrate::check_start(&i.root).is_err(),
             "{name}: refused before the download"
         );
-        assert!(migrate::start(&lock).is_err(), "{name}");
+        assert!(start(&lock).is_err(), "{name}");
         assert_eq!(i.snapshot(), before, "{name}");
     }
 }
@@ -664,11 +722,11 @@ fn an_open_game_file_blocks_the_rename_and_changes_nothing() {
         .share_mode(0x1 | 0x2) // FILE_SHARE_READ | FILE_SHARE_WRITE
         .open(i.root.join("ftesurf/logs/qconsole.log"))
         .unwrap();
-    let e = migrate::start(&lock).unwrap_err();
+    let e = start(&lock).unwrap_err();
     assert!(format!("{e:#}").contains("nothing was changed"), "{e:#}");
     drop(open);
     assert_eq!(i.snapshot(), before);
-    migrate::start(&lock).unwrap();
+    start(&lock).unwrap();
 }
 
 #[test]
@@ -677,7 +735,7 @@ fn case_of_the_new_folder_follows_the_filesystem() {
     put(&i.root.join("WorldofSurf/notes.txt"), b"x");
     let lock = i.lock();
     // one folder on Windows, a different one on Linux
-    assert_eq!(migrate::start(&lock).is_err(), cfg!(windows));
+    assert_eq!(start(&lock).is_err(), cfg!(windows));
 }
 
 #[tokio::test]
@@ -685,7 +743,7 @@ async fn an_empty_worldofsurf_folder_is_replaced() {
     let i = Install::legacy("emptynew", true);
     fs::create_dir(i.root.join("worldofsurf")).unwrap();
     let lock = i.lock();
-    migrate::start(&lock).unwrap();
+    start(&lock).unwrap();
     update(&lock, &wos("ftesurf"), Identity::WorldOfSurf, Stop::No)
         .await
         .unwrap();
@@ -699,13 +757,13 @@ async fn interrupted_moves_that_no_longer_fit_are_refused() {
     let i = Install::legacy("reappear", true);
     {
         let lock = i.lock();
-        assert!(migrate::start_with(&lock, &mut stop_at(Point::Recorded(Step::Renamed))).is_err());
+        assert!(start_with(&lock, &mut stop_at(Point::Recorded(Step::Renamed))).is_err());
     }
     for (leaf, bytes) in DATS {
         put(&i.root.join("ftesurf").join(leaf), bytes);
     }
     let lock = i.lock();
-    assert!(migrate::resume(&lock).is_err());
+    assert!(resume(&lock).is_err());
     assert_eq!(
         i.read(u::MARKER).unwrap(),
         b"ftesurf\n",
@@ -728,7 +786,7 @@ async fn interrupted_moves_that_no_longer_fit_are_refused() {
     let k = Install::legacy("damaged", true);
     put(&k.root.join(migrate::JOURNAL), b"{\"step\":\"marked\"}");
     let lock = k.lock();
-    assert!(migrate::resume(&lock).is_err());
+    assert!(resume(&lock).is_err());
     assert!(migrate::eligible(&k.root).is_err());
 }
 
@@ -737,7 +795,7 @@ async fn finish_waits_for_a_verified_install() {
     let i = Install::legacy("unverified", true);
     let f = wos("ftesurf");
     let lock = i.lock();
-    migrate::start(&lock).unwrap();
+    start(&lock).unwrap();
     let m = u::decode(&f.envelope, &f.key, false, Identity::WorldOfSurf).unwrap();
     assert!(
         migrate::finish(&lock, &m).await.is_err(),
@@ -745,7 +803,7 @@ async fn finish_waits_for_a_verified_install() {
     );
     assert_eq!(
         i.read(&format!(
-            ".ftesurf-updater/legacy/{}",
+            ".ftesurf-updater/legacy/{}.parked",
             Identity::Legacy.exec()
         ))
         .unwrap(),
@@ -762,7 +820,7 @@ async fn the_marker_is_rewritten_only_by_the_move() {
     assert!(u::establish_identity(&i.root, Identity::WorldOfSurf).is_err());
     assert_eq!(i.read(u::MARKER).unwrap(), b"ftesurf\n");
     let lock = i.lock();
-    migrate::start(&lock).unwrap();
+    start(&lock).unwrap();
     assert_eq!(i.read(u::MARKER).unwrap(), b"worldofsurf\n");
     update(&lock, &wos("ftesurf"), Identity::WorldOfSurf, Stop::No)
         .await
@@ -771,7 +829,7 @@ async fn the_marker_is_rewritten_only_by_the_move() {
         u::establish_identity(&i.root, Identity::Legacy).is_err(),
         "never back"
     );
-    assert!(migrate::start(&lock).is_err(), "never twice");
+    assert!(start(&lock).is_err(), "never twice");
     assert_eq!(i.read(u::MARKER).unwrap(), b"worldofsurf\n");
 }
 
@@ -809,7 +867,7 @@ async fn without_a_worldofsurf_feed_a_legacy_install_updates_as_before() {
     assert!(migrate::eligible(&i.root).unwrap());
     assert_eq!(i.snapshot(), before, "probing changes nothing");
     let lock = i.lock();
-    assert!(!migrate::resume(&lock).unwrap());
+    assert!(!resume(&lock).unwrap());
     update(&lock, &legacy, Identity::Legacy, Stop::No)
         .await
         .unwrap();
@@ -845,7 +903,7 @@ fn a_fresh_install_is_not_offered_the_move() {
 async fn mainconfig_worldofsurf_renames_the_cfg_once() {
     let i = Install::legacy("mainconfig", true);
     let lock = i.lock();
-    migrate::start(&lock).unwrap();
+    start_feed(&lock, &wos("worldofsurf")).unwrap();
     update(&lock, &wos("worldofsurf"), Identity::WorldOfSurf, Stop::No)
         .await
         .unwrap();
@@ -854,7 +912,7 @@ async fn mainconfig_worldofsurf_renames_the_cfg_once() {
     // a worldofsurf.cfg already there is never overwritten
     let j = Install::legacy("mainconfig-both", true);
     let lock = j.lock();
-    migrate::start(&lock).unwrap();
+    start_feed(&lock, &wos("worldofsurf")).unwrap();
     put(
         &j.root.join("worldofsurf/worldofsurf.cfg"),
         b"newer settings",
@@ -874,7 +932,7 @@ async fn only_the_signed_default_fmf_names_the_cfg() {
     let i = Install::legacy("tampered-fmf", true);
     let f = wos("ftesurf");
     let lock = i.lock();
-    migrate::start(&lock).unwrap();
+    start(&lock).unwrap();
     let m = u::decode(&f.envelope, &f.key, false, Identity::WorldOfSurf).unwrap();
     let st = u::load_state(&i.root, Identity::WorldOfSurf).unwrap();
     let (jobs, _) = u::plan(&m, &i.root, &st, Identity::WorldOfSurf)
@@ -901,15 +959,21 @@ async fn a_custom_feed_url_survives_the_move() {
     let custom = b"update_manifest_url \"https://example.invalid/feed.json\"\n";
     put(&i.root.join("ftesurf/ftesurf.cfg"), custom);
     let lock = i.lock();
-    migrate::start(&lock).unwrap();
+    start(&lock).unwrap();
     assert_eq!(i.read("worldofsurf/ftesurf.cfg").unwrap(), custom);
 }
 
 #[tokio::test]
 async fn a_feed_that_would_strand_settings_moves_nothing() {
-    for (n, mainconfig) in ["WorldofSurf", "fte", "ftesurf\nMAINCONFIG worldofsurf"]
-        .into_iter()
-        .enumerate()
+    for (n, mainconfig) in [
+        "WorldofSurf",
+        "fte",
+        "ftesurf\nMAINCONFIG worldofsurf",
+        "ftesurf\nDISABLEHOMEDIR 0",
+        "ftesurf\n*basegame ftesurf",
+    ]
+    .into_iter()
+    .enumerate()
     {
         let i = Install::legacy(&format!("badfmf{n}"), true);
         let lock = i.lock();
@@ -972,7 +1036,7 @@ async fn a_link_at_the_cfg_temp_name_is_never_written_through() {
     .unwrap();
     {
         let lock = i.lock();
-        assert!(migrate::start(&lock).is_err());
+        assert!(start(&lock).is_err());
     }
     assert_eq!(fs::read(victim.join("keep.txt")).unwrap(), b"victim");
     assert!(
@@ -1007,9 +1071,235 @@ fn a_held_empty_worldofsurf_folder_changes_nothing() {
         .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS: open a directory
         .open(i.root.join("worldofsurf"))
         .unwrap();
-    let e = migrate::start(&lock).unwrap_err();
+    let e = start(&lock).unwrap_err();
     assert!(format!("{e:#}").contains("nothing was changed"), "{e:#}");
     assert_eq!(i.snapshot(), before, "the exe is back and the intent gone");
     drop(open);
-    migrate::start(&lock).unwrap();
+    start(&lock).unwrap();
+}
+
+fn parked(i: &Install, name: &str) -> Option<Vec<u8>> {
+    i.read(&format!(".ftesurf-updater/legacy/{name}.parked"))
+}
+
+/// An exiting engine saves its cfg after releasing the lock: a ftesurf/ that comes back after
+/// the rename is reported, never deleted, and holds finish() until it is gone (or empty).
+#[tokio::test]
+async fn a_recreated_ftesurf_folder_is_reported_and_holds_finish() {
+    let f = wos("ftesurf");
+    let i = Install::legacy("recreated", true);
+    {
+        let lock = i.lock();
+        move_install(&lock, &f).await.unwrap();
+    }
+    put(&i.root.join("ftesurf/ftesurf.cfg"), b"seta sensitivity 3\n");
+    let lock = i.lock();
+    assert!(resume(&lock).unwrap(), "the move goes on");
+    assert_eq!(
+        migrate::legacy_leftovers(&i.root).unwrap(),
+        ["ftesurf/ftesurf.cfg"]
+    );
+    let e = update(&lock, &f, Identity::WorldOfSurf, Stop::No)
+        .await
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("ftesurf/ftesurf.cfg"), "{e:#}");
+    assert_eq!(
+        migrate::read_journal(&i.root).unwrap(),
+        Some(Step::Marked),
+        "finish waits"
+    );
+    assert!(
+        !i.has_barrier(),
+        "the install itself verified and can start"
+    );
+    assert_eq!(parked(&i, Identity::Legacy.exec()).unwrap(), LEGACY_EXE);
+    assert_eq!(
+        i.read("ftesurf/ftesurf.cfg").unwrap(),
+        b"seta sensitivity 3\n",
+        "never deleted"
+    );
+    drop(lock);
+    fs::remove_dir_all(i.root.join("ftesurf")).unwrap();
+    assert!(next_start(&i, &f).await.unwrap());
+    assert_moved(&i, "ftesurf.cfg");
+    // an empty one is removed
+    let j = Install::legacy("recreated-empty", true);
+    let lock = j.lock();
+    move_install(&lock, &f).await.unwrap();
+    fs::create_dir(j.root.join("ftesurf")).unwrap();
+    update(&lock, &f, Identity::WorldOfSurf, Stop::No)
+        .await
+        .unwrap();
+    assert_moved(&j, "ftesurf.cfg");
+}
+
+#[tokio::test]
+async fn an_intent_without_its_barrier_never_started() {
+    let foreign: &[u8] = br#"{"envelope":"an older launcher's update","paths":[]}"#;
+    for (n, pending) in [None, Some(foreign)].into_iter().enumerate() {
+        let i = Install::legacy(&format!("unstarted{n}"), true);
+        let lock = i.lock();
+        let before = i.snapshot();
+        assert!(start_with(&lock, &mut stop_at(Point::Recorded(Step::Intent))).is_err());
+        if let Some(bytes) = pending {
+            put(&i.root.join(".ftesurf-updater/pending.json"), bytes);
+        }
+        assert!(!resume(&lock).unwrap(), "abandoned, not resumed");
+        assert!(i.read(migrate::JOURNAL).is_none() && i.read(migrate::FEED).is_none());
+        assert_eq!(
+            i.read(".ftesurf-updater/pending.json").as_deref(),
+            pending,
+            "an older launcher's update is left for recover()"
+        );
+        assert_eq!(i.read(Identity::Legacy.exec()).unwrap(), LEGACY_EXE);
+        if pending.is_none() {
+            assert_eq!(i.snapshot(), before);
+            assert!(migrate::eligible(&i.root).unwrap(), "offered again");
+        }
+    }
+}
+
+#[test]
+fn a_link_appearing_at_the_parked_folder_never_strands_the_rollback() {
+    let i = Install::legacy("parkedlink", true);
+    fs::create_dir(i.root.join("elsewhere")).unwrap();
+    let lock = i.lock();
+    let root = i.root.clone();
+    let e = start_with(&lock, &mut |p| {
+        if p == Point::Barrier {
+            dir_link(
+                &root.join("elsewhere"),
+                &root.join(".ftesurf-updater/legacy"),
+            );
+        }
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(format!("{e:#}").contains("nothing was changed"), "{e:#}");
+    assert!(i.read(migrate::JOURNAL).is_none() && !i.has_barrier());
+    assert_eq!(i.read(Identity::Legacy.exec()).unwrap(), LEGACY_EXE);
+    assert!(i.root.join("ftesurf/menu.dat").is_file());
+    assert!(
+        fs::read_dir(i.root.join("elsewhere"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "nothing written through the link"
+    );
+}
+
+#[tokio::test]
+async fn the_move_installs_only_the_release_it_approved() {
+    let f = wos("ftesurf");
+    let i = Install::legacy("approved", true);
+    let lock = i.lock();
+    move_install(&lock, &f).await.unwrap();
+    let approved = i.read(migrate::FEED).unwrap();
+    assert_eq!(approved, f.envelope.as_bytes());
+    let newer = feed(Identity::WorldOfSurf, "0.1.50", "ftesurf", TEST_SEED).envelope;
+    for (name, bytes) in [
+        ("another signed release", Some(newer.into_bytes())),
+        (
+            "a damaged copy",
+            Some(approved[..approved.len() - 1].to_vec()),
+        ),
+        ("no copy", None),
+    ] {
+        match &bytes {
+            Some(b) => put(&i.root.join(migrate::FEED), b),
+            None => fs::remove_file(i.root.join(migrate::FEED)).unwrap(),
+        }
+        assert!(
+            migrate::approved_feed(&i.root, &f.key, false).is_err(),
+            "{name}"
+        );
+        assert!(resume(&lock).is_err(), "{name}");
+    }
+    put(&i.root.join(migrate::FEED), &approved);
+    // the version is the journal's, not only the bytes' hash
+    let journal = fs::read_to_string(i.root.join(migrate::JOURNAL)).unwrap();
+    put(
+        &i.root.join(migrate::JOURNAL),
+        journal.replace("\"0.1.49\"", "\"0.1.50\"").as_bytes(),
+    );
+    assert!(migrate::approved_feed(&i.root, &f.key, false).is_err());
+    put(&i.root.join(migrate::JOURNAL), journal.as_bytes());
+    // offline: everything the moved install lacks is already staged
+    assert!(resume(&lock).unwrap());
+    let (_, m) = migrate::approved_feed(&i.root, &f.key, false).unwrap();
+    assert_eq!(m.version, "0.1.49");
+    let st = u::load_state(&i.root, Identity::WorldOfSurf).unwrap();
+    let (jobs, _) = u::plan(&m, &i.root, &st, Identity::WorldOfSurf)
+        .await
+        .unwrap();
+    let staging = i.root.join(".ftesurf-updater/download");
+    for j in &jobs {
+        assert!(
+            u::matches(&staging, j, Identity::WorldOfSurf)
+                .await
+                .unwrap(),
+            "{} staged",
+            j.path
+        );
+    }
+    update(&lock, &f, Identity::WorldOfSurf, Stop::No)
+        .await
+        .unwrap();
+    assert_moved(&i, "ftesurf.cfg");
+}
+
+#[tokio::test]
+async fn legacy_exes_are_parked_and_only_the_known_ones_deleted() {
+    let f = wos("ftesurf");
+    let other = other_exe(Identity::Legacy);
+    // a shared install: both platforms' legacy exes, both in the ledger
+    let i = Install::legacy("shared", true);
+    put(&i.root.join(other), b"other legacy engine");
+    let mut st: serde_json::Value =
+        serde_json::from_slice(&i.read(".ftesurf-updater/state.json").unwrap()).unwrap();
+    st["files"][other] = blake(b"other legacy engine").into();
+    put(
+        &i.root.join(".ftesurf-updater/state.json"),
+        &serde_json::to_vec(&st).unwrap(),
+    );
+    let lock = i.lock();
+    move_install(&lock, &f).await.unwrap();
+    for name in [Identity::Legacy.exec(), other] {
+        assert!(i.read(name).is_none(), "{name} left the root");
+        assert!(parked(&i, name).is_some(), "{name} parked");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = i
+                .root
+                .join(format!(".ftesurf-updater/legacy/{name}.parked"));
+            let mode = fs::metadata(p).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0, "{name} parked without execute");
+        }
+    }
+    // a known exe put back in the root goes too
+    put(&i.root.join(Identity::Legacy.exec()), LEGACY_EXE);
+    update(&lock, &f, Identity::WorldOfSurf, Stop::No)
+        .await
+        .unwrap();
+    assert_moved(&i, "ftesurf.cfg");
+    assert!(i.read(other).is_none());
+    // exes the ledger does not know (the player's own builds) are kept, wherever they are
+    let j = Install::legacy("unknown-exe", true);
+    put(&j.root.join(Identity::Legacy.exec()), b"a build of my own");
+    let lock = j.lock();
+    move_install(&lock, &f).await.unwrap();
+    put(&j.root.join(other), b"another build of my own");
+    update(&lock, &f, Identity::WorldOfSurf, Stop::No)
+        .await
+        .unwrap();
+    assert_eq!(
+        parked(&j, Identity::Legacy.exec()).unwrap(),
+        b"a build of my own"
+    );
+    assert_eq!(j.read(other).unwrap(), b"another build of my own");
+    assert!(
+        j.read(migrate::JOURNAL).is_none(),
+        "the move still finishes"
+    );
 }
