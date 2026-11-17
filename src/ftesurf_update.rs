@@ -47,7 +47,7 @@ impl Identity {
         }
     }
     /// The win64 and linux64 executables.
-    fn exes(self) -> [&'static str; 2] {
+    pub(crate) fn exes(self) -> [&'static str; 2] {
         match self {
             Identity::Legacy => ["ftesurf64.exe", "ftesurf64"],
             Identity::WorldOfSurf => ["WorldofSurf.exe", "worldofsurf64"],
@@ -67,10 +67,11 @@ impl Identity {
 }
 
 /// What an install with neither gamedir gets; the feed URL follows. Stays Legacy until a
-/// worldofsurf feed is published (stage 3 flips it).
+/// worldofsurf feed is published: stage 3 flips it in the release that publishes that feed.
+/// Until then a fresh install is legacy and its next start moves it (ftesurf_migrate).
 pub const FRESH_INSTALL: Identity = Identity::Legacy;
 
-fn inspect(p: &Path) -> Result<Option<fs::Metadata>> {
+pub(crate) fn inspect(p: &Path) -> Result<Option<fs::Metadata>> {
     match fs::symlink_metadata(p) {
         Ok(md) => Ok(Some(md)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -78,7 +79,7 @@ fn inspect(p: &Path) -> Result<Option<fs::Metadata>> {
     }
 }
 
-fn is_link(md: &fs::Metadata) -> bool {
+pub(crate) fn is_link(md: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -128,21 +129,46 @@ pub fn read_marker(root: &Path) -> Result<Option<Identity>> {
         .with_context(|| format!("damaged install identity marker: {MARKER}"))
 }
 
-/// Record `id` once an install is verified under it (fresh install or first verified update;
-/// stage 2's folder move rewrites it). Call under the install lock.
+/// Record `id` once an install is verified under it (fresh install or first verified update).
+/// Never rewrites a marker. Call under the install lock.
 pub fn establish_identity(root: &Path, id: Identity) -> Result<()> {
+    record_identity(root, id, None)
+}
+
+/// establish_identity plus the one rewrite there is, ftesurf -> worldofsurf, made by the folder
+/// move's marker step: only ftesurf_migrate can construct a MoveToken.
+pub(crate) fn record_identity(
+    root: &Path,
+    id: Identity,
+    moving: Option<&crate::ftesurf_migrate::MoveToken>,
+) -> Result<()> {
+    let line = format!("{}\n", id.game());
     match read_marker(root)? {
-        Some(have) => {
-            ensure!(
-                have == id,
-                "install identity marker says {}, not {}",
-                have.game(),
-                id.game()
-            );
-            Ok(())
+        None => write_meta(root, "identity", line.as_bytes(), id),
+        Some(have) if have == id => Ok(()),
+        Some(Identity::Legacy) if id == Identity::WorldOfSurf && moving.is_some() => {
+            replace_meta(root, "identity", line.as_bytes(), id)
         }
-        None => write_meta(root, "identity", format!("{}\n", id.game()).as_bytes(), id),
+        Some(have) => anyhow::bail!(
+            "install identity marker says {}, not {}",
+            have.game(),
+            id.game()
+        ),
     }
+}
+
+/// The identity of an install where neither gamedir counts. A real ftesurf/ folder there is a
+/// damaged legacy install, repaired as one and then moved, so a FRESH_INSTALL of WorldOfSurf never
+/// starts a new gamedir beside the player's files. Identical to FRESH_INSTALL while it is Legacy.
+fn unclaimed(root: &Path, fresh: Identity) -> Result<Identity> {
+    let legacy = root.join(Identity::Legacy.gamedir().trim_end_matches('/'));
+    Ok(
+        if inspect(&legacy)?.is_some_and(|md| md.is_dir() && !is_link(&md)) {
+            Identity::Legacy
+        } else {
+            fresh
+        },
+    )
 }
 
 /// The one identity rule (P1593): the marker when there is one; otherwise the gamedir on disk.
@@ -161,7 +187,41 @@ pub fn install_identity(root: &Path) -> Result<Identity> {
         ),
         (true, false) => Ok(Identity::Legacy),
         (false, true) => Ok(Identity::WorldOfSurf),
-        (false, false) => Ok(FRESH_INSTALL),
+        (false, false) => unclaimed(root, FRESH_INSTALL),
+    }
+}
+
+/// The install lock; the engine takes the same one before loading anything (qkupdate.c
+/// QKU_FSLock). The folder move takes one as proof that neither the game nor another launcher runs.
+pub struct InstallLock {
+    file: fs::File,
+    root: PathBuf,
+}
+
+impl InstallLock {
+    /// Err while the game or another launcher holds it.
+    pub fn try_acquire(root: &Path, id: Identity) -> Result<Self> {
+        let path = checked_path(root, ".ftesurf-updater/install.lock", id)?;
+        fs::create_dir_all(path.parent().unwrap())?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        fs2::FileExt::try_lock_exclusive(&file)?;
+        Ok(Self {
+            file,
+            root: root.to_path_buf(),
+        })
+    }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    /// Before spawning the game, which takes the lock itself.
+    pub fn unlock(&self) -> Result<()> {
+        fs2::FileExt::unlock(&self.file)?;
+        Ok(())
     }
 }
 
@@ -730,31 +790,78 @@ pub fn write_meta(root: &Path, name: &str, bytes: &[u8], id: Identity) -> Result
     Ok(())
 }
 
+/// write_meta without its gap: one rename replaces the old file, so a crash leaves the old
+/// bytes or the new, never neither. For the folder move's journal, barrier, ledger and marker.
+pub fn replace_meta(root: &Path, name: &str, bytes: &[u8], id: Identity) -> Result<()> {
+    let p = checked_path(root, &format!("{META}/{name}"), id)?;
+    let tmp = checked_path(root, &format!("{META}/{name}.tmp"), id)?;
+    fs::create_dir_all(p.parent().unwrap())?;
+    replace_file(&tmp, &p, bytes)
+}
+
+/// Write `tmp` durably, rename it over `dest` (both platforms replace a file), sync the rename.
+pub(crate) fn replace_file(tmp: &Path, dest: &Path, bytes: &[u8]) -> Result<()> {
+    {
+        use std::io::Write;
+        let mut f = fs::File::create(tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    fs::rename(tmp, dest)?;
+    sync_dir(dest.parent().context("no parent directory")?)
+}
+
+/// POSIX makes a rename durable only once its directory is synced; Windows has no directory
+/// handle to sync through std.
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 pub fn begin(root: &Path, envelope: &str, jobs: &[FileEntry], id: Identity) -> Result<()> {
+    let journal = serde_json::to_vec(&Journal {
+        envelope: envelope.into(),
+        paths: jobs.iter().map(|f| f.path.clone()).collect(),
+    })?;
+    // The folder move's barrier is the one pending.json an update takes over, in one rename,
+    // so the game stays blocked from the move until this update's recovery finishes.
+    if crate::ftesurf_migrate::pending_barrier(root)? == Some(crate::ftesurf_migrate::Step::Marked)
+    {
+        return replace_meta(root, "pending.json", &journal, id);
+    }
     ensure!(
         !checked_path(root, ".ftesurf-updater/pending.json", id)?.exists(),
         "unfinished update exists"
     );
-    write_meta(
-        root,
-        "pending.json",
-        &serde_json::to_vec(&Journal {
-            envelope: envelope.into(),
-            paths: jobs.iter().map(|f| f.path.clone()).collect(),
-        })?,
-        id,
-    )
+    write_meta(root, "pending.json", &journal, id)
 }
 
 /// Forward recovery, not a pretend multi-file atomic rename. A pending marker blocks the
 /// game from booting a mixed set. One previous copy per managed file remains for rollback.
 pub async fn recover(root: &Path, allow_insecure: bool, id: Identity) -> Result<()> {
+    recover_with_key(root, PUBLIC_KEY, allow_insecure, id).await
+}
+
+/// recover() with the verifying key as a parameter, for tests; the launcher pins PUBLIC_KEY.
+pub async fn recover_with_key(
+    root: &Path,
+    public_key: &str,
+    allow_insecure: bool,
+    id: Identity,
+) -> Result<()> {
     let pending = checked_path(root, ".ftesurf-updater/pending.json", id)?;
     if !pending.exists() {
         return Ok(());
     }
+    // The folder move's barrier is not an update: its own update replaces it (begin).
+    if crate::ftesurf_migrate::pending_barrier(root)?.is_some() {
+        return Ok(());
+    }
     let j: Journal = serde_json::from_slice(&fs::read(&pending)?)?;
-    let m = decode(&j.envelope, PUBLIC_KEY, allow_insecure, id)?;
+    let m = decode(&j.envelope, public_key, allow_insecure, id)?;
     let mut st = load_state(root, id)?;
     if !st.version.is_empty() {
         ensure!(
@@ -1245,6 +1352,31 @@ mod tests {
         assert!(checked_path(&r.0, "ftesurf/menu.dat", Identity::WorldOfSurf).is_err());
         assert!(checked_path(&r.0, "worldofsurf/menu.dat", Identity::Legacy).is_err());
         assert!(checked_path(&r.0, ".ftesurf-updater/state.json", Identity::WorldOfSurf).is_ok());
+    }
+
+    #[test]
+    fn a_damaged_legacy_install_is_never_fresh() {
+        let r = Root::new("unclaimed");
+        assert_eq!(
+            unclaimed(&r.0, Identity::WorldOfSurf).unwrap(),
+            Identity::WorldOfSurf
+        );
+        game_files(&r.0.join("ftesurf"), &["menu.dat"]); // one file: does not count
+        assert_eq!(install_identity(&r.0).unwrap(), Identity::Legacy);
+        assert_eq!(
+            unclaimed(&r.0, Identity::WorldOfSurf).unwrap(),
+            Identity::Legacy
+        );
+        assert_eq!(unclaimed(&r.0, Identity::Legacy).unwrap(), Identity::Legacy);
+        fs::remove_dir_all(r.0.join("ftesurf")).unwrap();
+        let elsewhere = r.0.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        dir_link(&elsewhere, &r.0.join("ftesurf"));
+        assert_eq!(
+            unclaimed(&r.0, Identity::WorldOfSurf).unwrap(),
+            Identity::WorldOfSurf,
+            "a linked folder is not the player's install"
+        );
     }
 
     #[test]

@@ -1,8 +1,10 @@
 //! World of Surf presentation for the signed FTESurf bootstrap: check, update, launch.
 use anyhow::{ensure, Context, Result};
 use clap::Parser;
-use fs2::FileExt;
-use quakers_launcher::{download, ftesurf_ui as ui, ftesurf_update as u};
+use quakers_launcher::{
+    download, ftesurf_migrate as migrate, ftesurf_ui as ui, ftesurf_update as u,
+    ftesurf_update::Identity,
+};
 use std::{fs, path::PathBuf, time::Duration};
 
 #[derive(Parser)]
@@ -41,6 +43,10 @@ struct Args {
     /// Default: the install identity's feed.
     #[arg(long)]
     manifest_url: Option<String>,
+    /// Harness only: the worldofsurf feed a legacy install may move to. With --manifest-url and
+    /// without this, no move is offered.
+    #[arg(long, hide = true)]
+    move_manifest_url: Option<String>,
     /// Harness only: allow HTTP to localhost. Signatures are still mandatory.
     #[arg(long)]
     allow_insecure: bool,
@@ -114,6 +120,20 @@ async fn fetch(client: &reqwest::Client, args: &Args, url: &str) -> Result<Strin
     String::from_utf8(bytes).context("manifest is not UTF-8")
 }
 
+/// The install verified, so a failed clean-up (the old exe in use) only waits for the next start.
+async fn finish_move(
+    lock: &u::InstallLock,
+    m: &quakers_launcher::manifest::Manifest,
+) -> Result<()> {
+    match migrate::finish(lock, m).await {
+        Ok(()) => ui::message("Moved to World of Surf.", "ftesurf/ is now worldofsurf/."),
+        Err(e) => ui::message(
+            "World of Surf is installed; the old files are cleaned up next start.",
+            &format!("{e:#}"),
+        ),
+    }
+}
+
 async fn run(a: &Args) -> Result<()> {
     u::checked_game_args(&a.game_args)?;
     ui::welcome()?;
@@ -125,22 +145,14 @@ async fn run(a: &Args) -> Result<()> {
     );
     ensure!(root.is_dir(), "install directory is missing");
     // P1593: the install's identity decides which feed, exe and gamedir every check below accepts.
-    let id = u::install_identity(&root)?;
+    let mut id = u::install_identity(&root)?;
     // Check the root before canonicalizing (which would hide a junction).
     u::checked_path(&root, ".ftesurf-updater/install.lock", id)?;
     let root = root.canonicalize()?;
-    let lockpath = u::checked_path(&root, ".ftesurf-updater/install.lock", id)?;
-    fs::create_dir_all(lockpath.parent().unwrap())?;
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lockpath)?;
     let mut attempts = 0;
-    loop {
-        match FileExt::try_lock_exclusive(&lock) {
-            Ok(()) => break,
+    let lock = loop {
+        match u::InstallLock::try_acquire(&root, id) {
+            Ok(lock) => break lock,
             Err(_) if a.wait_for_game && attempts < 200 => {
                 attempts += 1;
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -150,15 +162,17 @@ async fn run(a: &Args) -> Result<()> {
                     .context("FTESurf or another updater is running; close it before updating")
             }
         }
-    }
+    };
     ensure!(
         u::install_identity(&root)? == id,
         "the install's game folder changed while waiting for its lock; start the launcher again"
     );
     // A source checkout must never be repaired back to the public release.
     let development = root.join(".git").try_exists()?;
+    let journal = u::checked_path(&root, migrate::JOURNAL, id)?.exists();
     ensure!(
-        !development || !u::checked_path(&root, ".ftesurf-updater/pending.json", id)?.exists(),
+        !development
+            || (!journal && !u::checked_path(&root, ".ftesurf-updater/pending.json", id)?.exists()),
         "unfinished release update in a development checkout; resolve it before launching (no files were promoted)"
     );
     // Recovery precedes ALL launch paths, but a dry run must not commit a transaction.
@@ -166,6 +180,20 @@ async fn run(a: &Args) -> Result<()> {
         !a.dry_run || !u::checked_path(&root, ".ftesurf-updater/pending.json", id)?.exists(),
         "unfinished update: dry run does not recover it; rerun --verify to finish safely"
     );
+    ensure!(
+        !a.dry_run || !journal,
+        "unfinished move to World of Surf: a dry run does not resume it"
+    );
+    // P1593 stage 2: an interrupted folder move is carried forward (or refused) before anything
+    // reads the install as one identity or recovers an update.
+    let mut moving = migrate::resume(&lock)?;
+    if moving {
+        id = u::install_identity(&root)?;
+        ensure!(
+            id == Identity::WorldOfSurf,
+            "the World of Surf move left no marker"
+        );
+    }
     u::recover(&root, a.allow_insecure, id).await?;
     let ingame_journal = u::checked_path(&root, ".ftesurf-updater/ingame/journal.json", id)?;
     let ingame_pending = ingame_journal.exists();
@@ -209,6 +237,10 @@ async fn run(a: &Args) -> Result<()> {
         on
     };
     ensure!(!ingame_pending || (enabled && !a.offline), "unfinished in-game update: enable updates so the launcher can verify and repair the complete signed release");
+    ensure!(
+        !moving || !migrate::awaits_update(&root)? || (enabled && !a.offline),
+        "the move to World of Surf is unfinished: enable updates so the launcher can install it (nothing was started)"
+    );
     let mut launch_manifest = None;
     if enabled && !a.offline {
         // P1208: say what is installed before anything is fetched.
@@ -228,13 +260,63 @@ async fn run(a: &Args) -> Result<()> {
             .connect_timeout(Duration::from_secs(4))
             .timeout(Duration::from_secs(120))
             .build()?;
-        match fetch(
-            &client,
-            a,
-            a.manifest_url.as_deref().unwrap_or(id.feed_url()),
-        )
-        .await
+        // P1593 stage 2: a legacy install moves once a signed worldofsurf feed answers. No
+        // answer, or one that does not verify, keeps the legacy feed exactly as before.
+        let mut probed = None;
+        let mut move_approved = false;
+        if !moving
+            && !ingame_pending
+            && (a.manifest_url.is_none() || a.move_manifest_url.is_some())
+            && migrate::eligible(&root)?
         {
+            let url = a
+                .move_manifest_url
+                .as_deref()
+                .unwrap_or(Identity::WorldOfSurf.feed_url());
+            if let Ok(text) = fetch(&client, a, url).await {
+                match migrate::offer(&text, u::PUBLIC_KEY, a.allow_insecure, &u::load_state(&root, id)?) {
+                    Ok(m) if a.dry_run => {
+                        ui::message(
+                            &format!("World of Surf {} is available: ftesurf/ would move to worldofsurf/.", m.version),
+                            "",
+                        )?;
+                        return Ok(());
+                    }
+                    Ok(m) => {
+                        if ui::choose(
+                            "Move to World of Surf?",
+                            &format!(
+                                "World of Surf {}  \u{b7}  ftesurf/ becomes worldofsurf/; settings, runs and maps move with it.",
+                                m.version
+                            ),
+                            a.yes,
+                        )? {
+                            ui::message("Moving to World of Surf\u{2026}", "ftesurf/ \u{2192} worldofsurf/")?;
+                            migrate::start(&lock)?;
+                            id = Identity::WorldOfSurf;
+                            moving = true;
+                            move_approved = true;
+                            probed = Some(text);
+                        } else {
+                            ui::message("Keeping FTESurf for now.", "")?;
+                        }
+                    }
+                    Err(e) => ui::message("Staying on FTESurf updates.", &format!("{e:#}"))?,
+                }
+            }
+        }
+        let fetched = match probed {
+            Some(text) => Ok(text),
+            None => {
+                fetch(
+                    &client,
+                    a,
+                    a.manifest_url.as_deref().unwrap_or(id.feed_url()),
+                )
+                .await
+            }
+        };
+        match fetched {
             Ok(envelope) => {
                 // Bad signatures/formats do NOT fall back and launch as if this were a network outage.
                 let m = u::decode(&envelope, u::PUBLIC_KEY, a.allow_insecure, id)?;
@@ -262,9 +344,11 @@ async fn run(a: &Args) -> Result<()> {
                     )?;
                     return Ok(());
                 }
+                let staging = u::checked_path(&root, ".ftesurf-updater/download", id)?;
                 if !jobs.is_empty() {
                     let total_bytes = jobs.iter().map(|f| f.size).sum();
                     if !install_approved
+                        && !move_approved
                         && !ui::choose(
                             if installed {
                                 "Update World of Surf?"
@@ -278,12 +362,11 @@ async fn run(a: &Args) -> Result<()> {
                         ui::message("Download cancelled. No game was started.", "")?;
                         return Ok(());
                     }
-                    let staging = u::checked_path(&root, ".ftesurf-updater/download", id)?;
                     let outcome = download::download_all_ftesurf_with_ui(
                         client,
                         m.mirrors.clone(),
                         m.hash_algo.clone(),
-                        staging,
+                        staging.clone(),
                         jobs.clone(),
                         total_bytes,
                         4,
@@ -303,9 +386,15 @@ async fn run(a: &Args) -> Result<()> {
                         outcome.failed
                     );
                     ui::message("Installing World of Surf…", "Downloads verified.")?;
+                    if moving {
+                        migrate::before_install(&lock, &staging, &m, &jobs).await?;
+                    }
                     u::begin(&root, &envelope, &jobs, id)?;
                     u::recover(&root, a.allow_insecure, id).await?;
                 } else {
+                    if moving {
+                        migrate::before_install(&lock, &staging, &m, &jobs).await?;
+                    }
                     // Adopt only after bytes AND executable permissions are ready.
                     u::prepare_install(&root, &m, id).await?;
                     let mut st = old;
@@ -319,6 +408,9 @@ async fn run(a: &Args) -> Result<()> {
                     u::write_meta(&root, "installed.json", envelope.as_bytes(), id)?;
                 }
                 u::check_complete(&root, &m, id).await?;
+                if moving {
+                    finish_move(&lock, &m).await?;
+                }
                 u::establish_identity(&root, id)?; // P1593: the first verified install records it
                 if ingame_pending {
                     // The fetched signed feed, not untrusted old journal entries, determines
@@ -348,6 +440,10 @@ async fn run(a: &Args) -> Result<()> {
             }
             Err(e) => {
                 ensure!(!ingame_pending, "cannot repair the unfinished in-game update while the update service is unavailable");
+                ensure!(
+                    !moving || !migrate::awaits_update(&root)?,
+                    "the move to World of Surf needs the update service to finish; nothing was started (try again online)"
+                );
                 ui::message(
                     "Update service unavailable. Checking the installed copy for offline play…",
                     &e.to_string(),
@@ -364,6 +460,9 @@ async fn run(a: &Args) -> Result<()> {
                     u::check_complete(&root, &m, id).await?;
                 } else {
                     u::prepare_install(&root, &m, id).await?;
+                    if moving {
+                        finish_move(&lock, &m).await?;
+                    }
                 }
                 launch_manifest = Some(m);
             }
@@ -391,7 +490,7 @@ async fn run(a: &Args) -> Result<()> {
     ui::message("Starting World of Surf…", "")?;
     // The engine takes this same lock BEFORE loading plugins/progs. Drop ours before spawn;
     // if another launcher wins that small gap, the engine refuses to boot, not a mixed set.
-    FileExt::unlock(&lock)?;
+    lock.unlock()?;
     let mut game = std::process::Command::new(exe);
     game.args(["-manifest", "default.fmf"])
         .args(&a.game_args)

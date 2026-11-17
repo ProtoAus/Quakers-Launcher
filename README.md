@@ -193,6 +193,20 @@ are never chmod targets. Explicit unsigned `--offline` does not repair permissio
 `--dry-run` never performs that repair or commits recovery; an unfinished launcher
 transaction refuses with guidance to rerun `--verify` without `--dry-run`.
 
+**Move to World of Surf (P1593 stage 2).** When a legacy install (`ftesurf/`) finds
+a signed worldofsurf feed at `ftesurf/worldofsurf.json`, the launcher asks once,
+then renames `ftesurf/` to `worldofsurf/` under the install lock before the first
+update from that feed. `.ftesurf-updater/migrate.json` journals the steps (intent,
+renamed, ledger, marked); an interrupted move is carried forward at the next start,
+or refused when the folders no longer fit it. Until the new feed's install verifies,
+`pending.json` holds a barrier every engine refuses to boot on, so a half-moved
+install never starts. The ledger's keys move with the folder, the cfg's saved legacy
+`update_manifest_url` line is dropped (a custom URL stays), `ftesurf.cfg` becomes
+`worldofsurf.cfg` only if the new `default.fmf` says `MAINCONFIG worldofsurf`, and
+the legacy exe is removed after the new install verifies. No feed, or one that does
+not verify, leaves a legacy install exactly as it was. `--manifest-url` without
+`--move-manifest-url` never offers the move.
+
 Developer controls in FTESurf's `tools/test_update_launcher.py` support both
 Windows and Linux (`--seed-file` supplies the private signing seed file).
 `tools/test_update_posix.py` exercises real fixture launches, lost execute bits,
