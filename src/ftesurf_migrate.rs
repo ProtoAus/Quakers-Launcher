@@ -1,13 +1,15 @@
 //! P1593 stage 2: the one-time move of a legacy install's `ftesurf/` to `worldofsurf/`, before
-//! the worldofsurf feed's first update. Journalled in JOURNAL; each step is recorded after its
-//! effect and every effect is idempotent, so resume() finishes an interrupted move from any point:
+//! the worldofsurf feed's first update. The launcher stages and checks that feed first
+//! (plan_moved, check_feed), so a failed download or a bad default.fmf moves nothing.
+//! Journalled in JOURNAL; each step is recorded after its effect and every effect is idempotent,
+//! so resume() finishes an interrupted move from any point:
 //!   intent  - journal written, then BARRIER as pending.json: every FTESurf engine refuses to boot
 //!             while pending.json exists (qkupdate.c QKU_FSLock); older launchers cannot parse it
-//!   renamed - ftesurf/ renamed to worldofsurf/: one rename, same volume
+//!   renamed - the legacy exe parked in PARKED, then ftesurf/ renamed to worldofsurf/
 //!   ledger  - state.json keys respelled; the main cfg's saved legacy feed URL dropped
 //!   marked  - the identity marker rewritten ftesurf -> worldofsurf (the commit point)
 //! The ordinary update then installs the worldofsurf feed; begin() swaps BARRIER for its own
-//! journal. finish() removes the legacy exe and the journal once that install verifies.
+//! journal. finish() deletes the parked exe and the journal once that install verifies.
 use crate::{
     ftesurf_update::{self as u, Identity, InstallLock},
     manifest::{FileEntry, Manifest},
@@ -30,6 +32,10 @@ pub const BARRIER: &[u8] = b"{\"move\":\"ftesurf/ to worldofsurf/ is unfinished;
 /// The legacy MAINCONFIG's file, and the one name a worldofsurf default.fmf may switch it to.
 const LEGACY_CFG: &str = "ftesurf.cfg";
 const NEW_CFG: &str = "worldofsurf.cfg";
+/// Where the legacy exe waits for finish(). An engine from before P1593 takes the install lock
+/// and honours pending.json only under GAME "FTESurf" (patch-1588 qkupdate.c:2170), so left in
+/// the root it would boot the new default.fmf unguarded.
+const PARKED: &str = ".ftesurf-updater/legacy";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -201,7 +207,8 @@ fn regular_or_absent(p: &Path) -> Result<bool> {
 }
 
 /// Everything the steps need, checked before the journal exists, so a refusal changes nothing.
-fn check_start(root: &Path) -> Result<()> {
+/// The launcher asks it before downloading; start() asks again under the same lock.
+pub fn check_start(root: &Path) -> Result<()> {
     ensure!(
         read_journal(root)?.is_none(),
         "a World of Surf move is already journalled"
@@ -231,7 +238,39 @@ fn check_start(root: &Path) -> Result<()> {
         "an in-game update is unfinished; it is repaired before the move"
     );
     regular_or_absent(&gamedir_path(root, Identity::Legacy).join(LEGACY_CFG))?;
+    regular_or_absent(&root.join(Identity::Legacy.exec()))?;
     u::load_state(root, Identity::Legacy)?;
+    Ok(())
+}
+
+fn parked_exe(root: &Path) -> Result<PathBuf> {
+    meta(root, &format!("{PARKED}/{}", Identity::Legacy.exec()))
+}
+
+/// Idempotent: a root exe (re)appearing is parked over an older parked copy.
+fn park_exe(root: &Path) -> Result<()> {
+    let exe = root.join(Identity::Legacy.exec());
+    if !regular_or_absent(&exe)? {
+        return Ok(());
+    }
+    let parked = parked_exe(root)?;
+    fs::create_dir_all(parked.parent().unwrap())?;
+    fs::rename(&exe, &parked).with_context(|| {
+        format!(
+            "could not move the old {} aside (in use?)",
+            Identity::Legacy.exec()
+        )
+    })?;
+    u::sync_dir(root)
+}
+
+fn unpark_exe(root: &Path) -> Result<()> {
+    let (exe, parked) = (root.join(Identity::Legacy.exec()), parked_exe(root)?);
+    if u::inspect(&exe)?.is_none() && regular_or_absent(&parked)? {
+        fs::rename(&parked, &exe)?;
+        u::sync_dir(root)?;
+    }
+    let _ = fs::remove_dir(parked.parent().unwrap()); // only when empty
     Ok(())
 }
 
@@ -248,6 +287,7 @@ fn ensure_barrier(root: &Path) -> Result<()> {
 
 /// Undo an intent whose rename did not happen: the install stays a working legacy one.
 fn roll_back(root: &Path) -> Result<()> {
+    unpark_exe(root)?;
     if pending_barrier(root)?.is_some() {
         fs::remove_file(meta(root, PENDING)?)?;
     }
@@ -261,29 +301,39 @@ fn rename(root: &Path) -> Result<()> {
         gamedir_path(root, Identity::Legacy),
         gamedir_path(root, Identity::WorldOfSurf),
     );
-    match (
+    let (l, w) = (
         gamedir(root, Identity::Legacy)?,
         gamedir(root, Identity::WorldOfSurf)?,
-    ) {
-        (Dir::Absent, Dir::Game) => return Ok(()), // renamed before an interruption
-        (Dir::Game, Dir::Absent) => {}
-        // Windows cannot rename onto a folder, so an empty one goes first everywhere.
-        (Dir::Game, Dir::Empty) => fs::remove_dir(&new)?,
+    );
+    match (l, w) {
+        // renamed before an interruption (check_start saw ftesurf/ with the game, worldofsurf/ without)
+        (Dir::Absent | Dir::Empty | Dir::Other, Dir::Game) => return park_exe(root),
+        (Dir::Game, Dir::Absent | Dir::Empty) => {}
         (l, w) => bail!(
             "cannot move ftesurf/ ({l:?}) to worldofsurf/ ({w:?}); the move is journalled in {JOURNAL}; inspect both folders before starting"
         ),
     }
-    if let Err(e) = fs::rename(&old, &new) {
+    // Windows cannot rename onto a folder, so an empty one goes first everywhere.
+    let moved = park_exe(root)
+        .and_then(|()| match w {
+            Dir::Empty => fs::remove_dir(&new).map_err(Into::into),
+            _ => Ok(()),
+        })
+        .and_then(|()| fs::rename(&old, &new).map_err(Into::into));
+    if let Err(e) = moved {
         if gamedir(root, Identity::Legacy)? == Dir::Game
-            && gamedir(root, Identity::WorldOfSurf)? == Dir::Absent
+            && matches!(
+                gamedir(root, Identity::WorldOfSurf)?,
+                Dir::Absent | Dir::Empty
+            )
         {
             roll_back(root)?;
             return Err(e).context(
-                "could not rename ftesurf/ to worldofsurf/ (is a file in it in use?); nothing was changed: close the game and anything using its folder, then start again",
+                "could not move ftesurf/ to worldofsurf/ (is a file in it in use?); nothing was changed: close the game and anything using its folder, then start again",
             );
         }
         return Err(e).context(format!(
-            "renaming ftesurf/ to worldofsurf/ failed part-way; the move is journalled in {JOURNAL}"
+            "moving ftesurf/ to worldofsurf/ failed part-way; the move is journalled in {JOURNAL}"
         ));
     }
     u::sync_dir(root)
@@ -370,8 +420,11 @@ fn without_legacy_feed(text: &[u8]) -> Vec<u8> {
 }
 
 fn respell(root: &Path) -> Result<()> {
+    park_exe(root)?; // done by the rename step; again here for an exe put back since
     let cfg = gamedir_path(root, Identity::WorldOfSurf).join(LEGACY_CFG);
-    if regular_or_absent(&cfg)? {
+    // A read-only cfg is the player's choice and stays as it is: a move that cannot finish would
+    // block the game, and the line only affects the in-game updater (the launcher's is per identity).
+    if regular_or_absent(&cfg)? && !fs::metadata(&cfg)?.permissions().readonly() {
         let text = fs::read(&cfg)?;
         let kept = without_legacy_feed(&text);
         if kept.len() != text.len() {
@@ -455,53 +508,94 @@ pub fn awaits_update(root: &Path) -> Result<bool> {
     Ok(pending_barrier(root)?.is_some())
 }
 
-/// default.fmf's one MAINCONFIG as the cfg file it names; None for none, two, or a value that
-/// is not a plain name.
-fn mainconfig(fmf: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(fmf).ok()?;
-    let mut found = None;
+/// The player's cfg name under a worldofsurf default.fmf, which must hold exactly one GAME
+/// "WorldofSurf", one BASEGAME "worldofsurf" and one MAINCONFIG naming ftesurf or worldofsurf
+/// (the engine reads the last MAINCONFIG; any other name would start the player on a fresh cfg).
+fn fmf_cfg(fmf: &[u8]) -> Result<&'static str> {
+    let text = std::str::from_utf8(fmf).context("default.fmf is not UTF-8")?;
+    let mut found: HashMap<String, Vec<String>> = HashMap::new();
     for line in text.lines() {
         let mut words = line.split("//").next().unwrap().split_ascii_whitespace();
-        if !words
-            .next()
-            .is_some_and(|w| w.eq_ignore_ascii_case("mainconfig"))
-        {
+        let Some(key) = words.next().map(str::to_ascii_lowercase) else {
+            continue;
+        };
+        if !matches!(key.as_str(), "game" | "basegame" | "mainconfig") {
             continue;
         }
-        let raw = words.next()?;
+        let raw = words.next().unwrap_or("");
         let value = match raw.strip_prefix('"') {
-            Some(q) => q.strip_suffix('"')?,
+            Some(q) => q
+                .strip_suffix('"')
+                .context("default.fmf holds an unpaired quote")?,
             None => raw,
         };
-        let name = value.strip_suffix(".cfg").unwrap_or(value);
-        if words.next().is_some()
-            || found.is_some()
-            || name.is_empty()
-            || !name
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-        {
-            return None;
-        }
-        found = Some(format!("{name}.cfg"));
+        ensure!(
+            words.next().is_none(),
+            "default.fmf's {key} line has extra words"
+        );
+        found.entry(key).or_default().push(value.to_string());
     }
-    found
+    let one = |key: &str| match found.get(key).map(Vec::as_slice) {
+        Some([v]) => Ok(v.as_str()),
+        _ => Err(anyhow::anyhow!(
+            "default.fmf must hold exactly one {key} line"
+        )),
+    };
+    ensure!(
+        one("game")? == "WorldofSurf" && one("basegame")? == "worldofsurf",
+        "default.fmf must say GAME \"WorldofSurf\" and BASEGAME \"worldofsurf\""
+    );
+    match one("mainconfig")? {
+        "ftesurf" | "ftesurf.cfg" => Ok(LEGACY_CFG),
+        "worldofsurf" | "worldofsurf.cfg" => Ok(NEW_CFG),
+        other => {
+            bail!("default.fmf's MAINCONFIG {other:?} would leave the player's settings behind")
+        }
+    }
 }
 
-/// Before the move's update is installed, while BARRIER or that update's journal still blocks
-/// the game: when the feed's verified default.fmf says `MAINCONFIG worldofsurf`, the player's
-/// ftesurf.cfg becomes worldofsurf.cfg. Anything else keeps ftesurf.cfg; both present keeps both.
-pub async fn before_install(
-    lock: &InstallLock,
+/// u::plan for the install as it will be once moved: each worldofsurf/ file is looked for at its
+/// ftesurf/ path and in the ledger under its legacy key. What the move's update downloads,
+/// staged before anything moves.
+pub async fn plan_moved(m: &Manifest, root: &Path, old: &State) -> Result<Vec<FileEntry>> {
+    let mut jobs = Vec::new();
+    for f in m.files_for_platform() {
+        let (rel, id) = match f.path.strip_prefix(Identity::WorldOfSurf.gamedir()) {
+            Some(tail) => (
+                format!("{}{tail}", Identity::Legacy.gamedir()),
+                Identity::Legacy,
+            ),
+            None => (f.path.clone(), Identity::WorldOfSurf),
+        };
+        let here = FileEntry {
+            path: rel.clone(),
+            ..f.clone()
+        };
+        if u::matches(root, &here, id).await? {
+            continue;
+        }
+        let p = u::checked_path(root, &rel, id)?;
+        if u::protected(&f.path, Identity::WorldOfSurf) && p.exists() {
+            let have = crate::hashing::hash_file(&p, "blake2b-256").await?;
+            if f.path == format!("{}fs_addons.txt", Identity::WorldOfSurf.gamedir())
+                || old.files.get(&rel) != Some(&have)
+            {
+                continue; // the player's edit, kept as plan() keeps it
+            }
+        }
+        jobs.push(f.clone());
+    }
+    Ok(jobs)
+}
+
+/// The feed's signed default.fmf, from staging when the update brings it: checked before the
+/// move starts and again before its update installs. Returns the player's cfg name.
+pub async fn check_feed(
+    root: &Path,
     staging: &Path,
     m: &Manifest,
     jobs: &[FileEntry],
-) -> Result<()> {
-    let root = lock.root();
-    ensure!(
-        read_journal(root)? == Some(Step::Marked),
-        "no World of Surf move is waiting for its update"
-    );
+) -> Result<&'static str> {
     let f = m
         .files_for_platform()
         .find(|f| f.path == "default.fmf")
@@ -515,8 +609,28 @@ pub async fn before_install(
         u::matches(base, f, Identity::WorldOfSurf).await?,
         "the World of Surf default.fmf does not match its signed hash"
     );
-    let fmf = fs::read(u::checked_path(base, "default.fmf", Identity::WorldOfSurf)?)?;
-    if mainconfig(&fmf).as_deref() != Some(NEW_CFG) {
+    fmf_cfg(&fs::read(u::checked_path(
+        base,
+        "default.fmf",
+        Identity::WorldOfSurf,
+    )?)?)
+}
+
+/// Before the move's update is installed, while BARRIER or that update's journal still blocks
+/// the game: when the feed's checked default.fmf says `MAINCONFIG worldofsurf`, the player's
+/// ftesurf.cfg becomes worldofsurf.cfg. An existing worldofsurf.cfg keeps both.
+pub async fn before_install(
+    lock: &InstallLock,
+    staging: &Path,
+    m: &Manifest,
+    jobs: &[FileEntry],
+) -> Result<()> {
+    let root = lock.root();
+    ensure!(
+        read_journal(root)? == Some(Step::Marked),
+        "no World of Surf move is waiting for its update"
+    );
+    if check_feed(root, staging, m, jobs).await? != NEW_CFG {
         return Ok(());
     }
     let dir = gamedir_path(root, Identity::WorldOfSurf);
@@ -529,7 +643,8 @@ pub async fn before_install(
 }
 
 /// Once the worldofsurf feed's install verifies (check_complete, run again here): drop BARRIER
-/// if no update took it over, then the legacy exe, then the journal.
+/// if no update took it over, then the parked legacy exe (and one that reappeared in the root),
+/// then the journal.
 pub async fn finish(lock: &InstallLock, m: &Manifest) -> Result<()> {
     finish_with(lock, m, &mut |_| Ok(())).await
 }
@@ -558,15 +673,14 @@ pub async fn finish_with(
     );
     hook(Point::BarrierRemoved)?;
     // A link at the old name is the player's; only the shipped file goes.
-    let exe = root.join(Identity::Legacy.exec());
-    if u::inspect(&exe)?.is_some_and(|md| md.is_file() && !u::is_link(&md)) {
-        fs::remove_file(&exe).with_context(|| {
-            format!(
-                "could not remove the old {} (in use?)",
-                Identity::Legacy.exec()
-            )
-        })?;
+    for exe in [root.join(Identity::Legacy.exec()), parked_exe(root)?] {
+        if u::inspect(&exe)?.is_some_and(|md| md.is_file() && !u::is_link(&md)) {
+            fs::remove_file(&exe)
+                .with_context(|| format!("could not remove the old {} (in use?)", exe.display()))?;
+            u::sync_dir(exe.parent().unwrap())?;
+        }
     }
+    let _ = fs::remove_dir(meta(root, PARKED)?); // only when empty
     hook(Point::ExeRemoved)?;
     let journal = meta(root, JOURNAL)?;
     fs::remove_file(&journal)?;
@@ -613,9 +727,10 @@ mod tests {
     }
 
     #[test]
-    fn mainconfig_names_one_plain_cfg() {
-        for (fmf, want) in [
-            ("GAME x\nMAINCONFIG worldofsurf\n", Some("worldofsurf.cfg")),
+    fn default_fmf_names_the_identity_and_one_known_cfg() {
+        let head = "FTEMANIFEST 1\nGAME \"WorldofSurf\"\nNAME \"World of Surf\"\nBASEGAME \"worldofsurf\"\n";
+        for (tail, want) in [
+            ("MAINCONFIG worldofsurf\n", Some("worldofsurf.cfg")),
             (
                 "MAINCONFIG \"worldofsurf\" // the player's settings\n",
                 Some("worldofsurf.cfg"),
@@ -626,16 +741,28 @@ mod tests {
                 "// MAINCONFIG worldofsurf\nMAINCONFIG ftesurf\n",
                 Some("ftesurf.cfg"),
             ),
-            ("GAME x\n", None),
-            ("MAINCONFIG worldofsurf\nMAINCONFIG worldofsurf\n", None),
+            ("", None),
+            ("MAINCONFIG ftesurf\nMAINCONFIG worldofsurf\n", None),
+            ("MAINCONFIG WorldofSurf\n", None),
+            ("MAINCONFIG fte\n", None),
             ("MAINCONFIG ../worldofsurf\n", None),
             ("MAINCONFIG \"worldofsurf\n", None),
             ("MAINCONFIG worldofsurf extra\n", None),
             ("MAINCONFIG\n", None),
+            ("MAINCONFIG ftesurf\nBASEGAME \"ftesurf\"\n", None),
+            ("MAINCONFIG ftesurf\nGAME \"World of Surf\"\n", None),
         ] {
-            assert_eq!(mainconfig(fmf.as_bytes()).as_deref(), want, "{fmf:?}");
+            let fmf = format!("{head}{tail}");
+            assert_eq!(fmf_cfg(fmf.as_bytes()).ok(), want, "{fmf:?}");
         }
-        assert_eq!(mainconfig(b"MAINCONFIG \xff\n"), None);
+        for bad_head in [
+            "GAME \"FTESurf\"\nBASEGAME \"worldofsurf\"\nMAINCONFIG ftesurf\n",
+            "GAME \"WorldofSurf\"\nBASEGAME \"ftesurf\"\nMAINCONFIG ftesurf\n",
+            "GAME \"WorldofSurf\"\nMAINCONFIG ftesurf\n",
+        ] {
+            assert!(fmf_cfg(bad_head.as_bytes()).is_err(), "{bad_head:?}");
+        }
+        assert!(fmf_cfg(b"GAME \"WorldofSurf\"\nBASEGAME worldofsurf\nMAINCONFIG \xff\n").is_err());
     }
 
     #[test]

@@ -120,6 +120,78 @@ async fn fetch(client: &reqwest::Client, args: &Args, url: &str) -> Result<Strin
     String::from_utf8(bytes).context("manifest is not UTF-8")
 }
 
+/// Downloads into staging what is not already there under its signed hash (a staged move, an
+/// interrupted run); recover() checks every staged file again before installing it. Returns
+/// the failed downloads.
+async fn stage(
+    client: &reqwest::Client,
+    m: &quakers_launcher::manifest::Manifest,
+    staging: &std::path::Path,
+    jobs: &[quakers_launcher::manifest::FileEntry],
+    id: Identity,
+    from: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut fetch = Vec::new();
+    for j in jobs {
+        if !u::matches(staging, j, id).await? {
+            fetch.push(j.clone());
+        }
+    }
+    if fetch.is_empty() {
+        return Ok(Vec::new());
+    }
+    let total_bytes = fetch.iter().map(|f| f.size).sum();
+    let outcome = download::download_all_ftesurf_with_ui(
+        client.clone(),
+        m.mirrors.clone(),
+        m.hash_algo.clone(),
+        staging.to_path_buf(),
+        fetch,
+        total_bytes,
+        4,
+        id,
+        quakers_launcher::ui::Header {
+            system: String::new(),
+            platform: quakers_launcher::manifest::platform_key().into(),
+            release: m.version.clone(),
+            mirror: m.mirrors.join(" · "),
+            from: from.into(),
+        },
+    )
+    .await?;
+    Ok(outcome.failed)
+}
+
+/// P1593 stage 2: everything that can fail without moving anything goes first: the move's
+/// preconditions, the worldofsurf feed's download into staging, its default.fmf. Then the move.
+async fn stage_move(
+    client: &reqwest::Client,
+    lock: &u::InstallLock,
+    m: &quakers_launcher::manifest::Manifest,
+) -> Result<()> {
+    let root = lock.root();
+    migrate::check_start(root)?;
+    let old = u::load_state(root, Identity::Legacy)?;
+    let jobs = migrate::plan_moved(m, root, &old).await?;
+    let staging = u::checked_path(root, ".ftesurf-updater/download", Identity::WorldOfSurf)?;
+    let failed = stage(
+        client,
+        m,
+        &staging,
+        &jobs,
+        Identity::WorldOfSurf,
+        &old.version,
+    )
+    .await?;
+    ensure!(failed.is_empty(), "download failed: {failed:?}");
+    migrate::check_feed(root, &staging, m, &jobs).await?;
+    ui::message(
+        "Moving to World of Surf\u{2026}",
+        "ftesurf/ \u{2192} worldofsurf/",
+    )?;
+    migrate::start(lock)
+}
+
 /// The install verified, so a failed clean-up (the old exe in use) only waits for the next start.
 async fn finish_move(
     lock: &u::InstallLock,
@@ -261,11 +333,14 @@ async fn run(a: &Args) -> Result<()> {
             .timeout(Duration::from_secs(120))
             .build()?;
         // P1593 stage 2: a legacy install moves once a signed worldofsurf feed answers. No
-        // answer, or one that does not verify, keeps the legacy feed exactly as before.
+        // answer, or one that does not verify, keeps the legacy feed exactly as before. Not on
+        // the in-game restart (--wait-for-game): the exiting engine still saves its cfg after
+        // releasing the lock, and that run never asks.
         let mut probed = None;
         let mut move_approved = false;
         if !moving
             && !ingame_pending
+            && !a.wait_for_game
             && (a.manifest_url.is_none() || a.move_manifest_url.is_some())
             && migrate::eligible(&root)?
         {
@@ -274,7 +349,12 @@ async fn run(a: &Args) -> Result<()> {
                 .as_deref()
                 .unwrap_or(Identity::WorldOfSurf.feed_url());
             if let Ok(text) = fetch(&client, a, url).await {
-                match migrate::offer(&text, u::PUBLIC_KEY, a.allow_insecure, &u::load_state(&root, id)?) {
+                match migrate::offer(
+                    &text,
+                    u::PUBLIC_KEY,
+                    a.allow_insecure,
+                    &u::load_state(&root, id)?,
+                ) {
                     Ok(m) if a.dry_run => {
                         ui::message(
                             &format!("World of Surf {} is available: ftesurf/ would move to worldofsurf/.", m.version),
@@ -291,12 +371,20 @@ async fn run(a: &Args) -> Result<()> {
                             ),
                             a.yes,
                         )? {
-                            ui::message("Moving to World of Surf\u{2026}", "ftesurf/ \u{2192} worldofsurf/")?;
-                            migrate::start(&lock)?;
-                            id = Identity::WorldOfSurf;
-                            moving = true;
-                            move_approved = true;
-                            probed = Some(text);
+                            match stage_move(&client, &lock, &m).await {
+                                Ok(()) => {
+                                    id = Identity::WorldOfSurf;
+                                    moving = true;
+                                    move_approved = true;
+                                    probed = Some(text);
+                                }
+                                // Nothing moved: this start stays on the legacy install.
+                                Err(e) if migrate::read_journal(&root)?.is_none() => ui::message(
+                                    "World of Surf is not installed yet; playing FTESurf this time.",
+                                    &format!("{e:#}"),
+                                )?,
+                                Err(e) => return Err(e),
+                            }
                         } else {
                             ui::message("Keeping FTESurf for now.", "")?;
                         }
@@ -362,28 +450,16 @@ async fn run(a: &Args) -> Result<()> {
                         ui::message("Download cancelled. No game was started.", "")?;
                         return Ok(());
                     }
-                    let outcome = download::download_all_ftesurf_with_ui(
-                        client,
-                        m.mirrors.clone(),
-                        m.hash_algo.clone(),
-                        staging.clone(),
-                        jobs.clone(),
-                        total_bytes,
-                        4,
-                        id,
-                        quakers_launcher::ui::Header {
-                            system: String::new(),
-                            platform: quakers_launcher::manifest::platform_key().into(),
-                            release: m.version.clone(),
-                            mirror: m.mirrors.join(" · "),
-                            from: from.clone(),
-                        },
-                    )
-                    .await?;
+                    let failed = stage(&client, &m, &staging, &jobs, id, &from).await?;
                     ensure!(
-                        outcome.failed.is_empty(),
-                        "download failed: {:?}; existing installation was not changed",
-                        outcome.failed
+                        failed.is_empty(),
+                        "download failed: {:?}; {}",
+                        failed,
+                        if moving {
+                            "the move to World of Surf finishes at the next start; the game cannot start until then"
+                        } else {
+                            "existing installation was not changed"
+                        }
                     );
                     ui::message("Installing World of Surf…", "Downloads verified.")?;
                     if moving {

@@ -800,14 +800,28 @@ pub fn replace_meta(root: &Path, name: &str, bytes: &[u8], id: Identity) -> Resu
 }
 
 /// Write `tmp` durably, rename it over `dest` (both platforms replace a file), sync the rename.
+/// `tmp` is created new: a stale regular one is removed first, anything else at that name (a
+/// planted link) is refused rather than written through.
 pub(crate) fn replace_file(tmp: &Path, dest: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(md) = inspect(tmp)? {
+        ensure!(
+            md.is_file() && !is_link(&md),
+            "{} is a link or not a regular file",
+            tmp.display()
+        );
+        fs::remove_file(tmp)?;
+    }
     {
         use std::io::Write;
-        let mut f = fs::File::create(tmp)?;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(tmp)
+            .with_context(|| format!("cannot write {}", tmp.display()))?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    fs::rename(tmp, dest)?;
+    fs::rename(tmp, dest).with_context(|| format!("cannot replace {}", dest.display()))?;
     sync_dir(dest.parent().context("no parent directory")?)
 }
 
