@@ -1527,3 +1527,88 @@ fn a_failed_rollback_keeps_the_move_error() {
     assert!(msg.contains(".parked back to"), "{msg}");
     drop(held);
 }
+
+/// Finish held, a later ordinary update carries the ledger past the approved release, then
+/// installed.json and move-feed.json are lost: the ledger shows the move's update ran, so every
+/// start falls through to the ordinary path (which rewrites installed.json) instead of refusing.
+#[tokio::test]
+async fn a_lost_installed_json_after_a_later_update_falls_through() {
+    let f = wos("ftesurf");
+    let later = feed(Identity::WorldOfSurf, "0.1.50", "ftesurf", TEST_SEED);
+    let i = Install::legacy("lost-installed", true);
+    let lock = i.lock();
+    move_install(&lock, &f).await.unwrap();
+    put(&i.root.join("ftesurf/ftesurf.cfg"), b"late save\n");
+    assert!(update(&lock, &f, Identity::WorldOfSurf, Stop::No)
+        .await
+        .is_err());
+    update(&lock, &later, Identity::WorldOfSurf, Stop::No)
+        .await
+        .unwrap();
+    assert_eq!(
+        u::load_state(&i.root, Identity::WorldOfSurf)
+            .unwrap()
+            .version,
+        "0.1.50"
+    );
+    fs::remove_file(i.root.join(".ftesurf-updater/installed.json")).unwrap();
+    fs::remove_file(i.root.join(migrate::FEED)).unwrap();
+    assert!(
+        !migrate::awaits_update(&i.root).unwrap(),
+        "the ledger records the move's update"
+    );
+    assert!(resume(&lock).unwrap(), "no approved feed needed");
+    update(&lock, &later, Identity::WorldOfSurf, Stop::No)
+        .await
+        .unwrap();
+    assert!(i.read(".ftesurf-updater/installed.json").is_some());
+    fs::remove_dir_all(i.root.join("ftesurf")).unwrap();
+    assert!(migrate::finish_installed(&lock, &key(), false)
+        .await
+        .unwrap());
+    assert!(i.read(migrate::JOURNAL).is_none());
+}
+
+/// A ledger at the approved version is not the move's update unless it records the worldofsurf
+/// exe (offer() allows a worldofsurf release equal to the legacy one).
+#[tokio::test]
+async fn an_equal_version_legacy_ledger_still_waits_for_the_update() {
+    let f = feed(Identity::WorldOfSurf, "0.1.48", "ftesurf", TEST_SEED);
+    let i = Install::legacy("equal-version", true);
+    let lock = i.lock();
+    start_feed(&lock, &f).unwrap();
+    fs::remove_file(i.root.join(".ftesurf-updater/pending.json")).unwrap();
+    assert!(migrate::awaits_update(&i.root).unwrap());
+}
+
+/// begin() swapped the barrier for its own journal and the launcher died before recover(): the
+/// approved feed is no longer needed, recover() finishes from that journal.
+#[tokio::test]
+async fn an_update_begun_needs_no_approved_feed() {
+    let f = wos("ftesurf");
+    let i = Install::legacy("begun", true);
+    {
+        let lock = i.lock();
+        start(&lock).unwrap();
+        assert!(update(&lock, &f, Identity::WorldOfSurf, Stop::AfterBegin)
+            .await
+            .is_err());
+    }
+    fs::remove_file(i.root.join(migrate::FEED)).unwrap();
+    assert!(next_start(&i, &f).await.unwrap());
+    assert_moved(&i, "ftesurf.cfg");
+}
+
+#[test]
+fn a_missing_approved_feed_names_the_fix() {
+    let i = Install::legacy("feed-fix", true);
+    let lock = i.lock();
+    start(&lock).unwrap();
+    fs::remove_file(i.root.join(migrate::FEED)).unwrap();
+    let e = resume(&lock).unwrap_err();
+    assert!(
+        format!("{e:#}")
+            .contains("delete .ftesurf-updater/migrate.json and .ftesurf-updater/pending.json"),
+        "{e:#}"
+    );
+}

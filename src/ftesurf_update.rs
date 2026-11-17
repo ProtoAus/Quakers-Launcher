@@ -771,27 +771,13 @@ struct Journal {
     paths: Vec<String>,
 }
 
+/// P1593: a rename over the old file, so a crash leaves the old bytes or the new, never neither
+/// (it used to delete first; a crash in that gap lost installed.json). Same as replace_meta.
 pub fn write_meta(root: &Path, name: &str, bytes: &[u8], id: Identity) -> Result<()> {
-    let p = checked_path(root, &format!("{META}/{name}"), id)?;
-    let tmp = checked_path(root, &format!("{META}/{name}.tmp"), id)?;
-    fs::create_dir_all(p.parent().unwrap())?;
-    {
-        use std::io::Write;
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    // Only metadata is removed here. A torn replacement cannot conceal pending game writes:
-    // pending.json is created before applying and stays present until the whole set verifies.
-    if p.exists() {
-        fs::remove_file(&p)?;
-    }
-    fs::rename(tmp, p)?;
-    Ok(())
+    replace_meta(root, name, bytes, id)
 }
 
-/// write_meta without its gap: one rename replaces the old file, so a crash leaves the old
-/// bytes or the new, never neither. For the folder move's journal, barrier, ledger and marker.
+/// One rename replaces the old file, so a crash leaves the old bytes or the new, never neither.
 pub fn replace_meta(root: &Path, name: &str, bytes: &[u8], id: Identity) -> Result<()> {
     let p = checked_path(root, &format!("{META}/{name}"), id)?;
     let tmp = checked_path(root, &format!("{META}/{name}.tmp"), id)?;
@@ -1390,6 +1376,36 @@ mod tests {
             unclaimed(&r.0, Identity::WorldOfSurf).unwrap(),
             Identity::WorldOfSurf,
             "a linked folder is not the player's install"
+        );
+    }
+
+    #[test]
+    fn write_meta_replaces_in_one_rename() {
+        let r = Root::new("writemeta");
+        write_meta(&r.0, "installed.json", b"old", Identity::Legacy).unwrap();
+        write_meta(&r.0, "installed.json", b"new", Identity::Legacy).unwrap();
+        assert_eq!(
+            fs::read(r.0.join(".ftesurf-updater/installed.json")).unwrap(),
+            b"new"
+        );
+        assert!(!r.0.join(".ftesurf-updater/installed.json.tmp").exists());
+        // a stale temp from an interrupted write is replaced, a link there refused
+        fs::write(r.0.join(".ftesurf-updater/installed.json.tmp"), b"stale").unwrap();
+        write_meta(&r.0, "installed.json", b"newer", Identity::Legacy).unwrap();
+        assert_eq!(
+            fs::read(r.0.join(".ftesurf-updater/installed.json")).unwrap(),
+            b"newer"
+        );
+        let elsewhere = r.0.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        dir_link(
+            &elsewhere,
+            &r.0.join(".ftesurf-updater").join("installed.json.tmp"),
+        );
+        assert!(write_meta(&r.0, "installed.json", b"x", Identity::Legacy).is_err());
+        assert_eq!(
+            fs::read(r.0.join(".ftesurf-updater/installed.json")).unwrap(),
+            b"newer"
         );
     }
 

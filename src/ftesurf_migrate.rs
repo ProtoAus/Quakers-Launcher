@@ -658,7 +658,10 @@ pub fn resume_with(
         return Ok(false);
     }
     // The approved feed pins the move's update; once that is installed only clean-up is left.
-    if j.step < Step::Marked || awaits_update(root)? {
+    // While begin()'s own journal holds that feed in pending.json, recover() finishes from it.
+    let underway =
+        j.step == Step::Marked && !barrier && u::inspect(&meta(root, PENDING)?)?.is_some();
+    if !underway && (j.step < Step::Marked || awaits_update(root)?) {
         approved_feed(root, public_key, allow_insecure)?;
     }
     advance(root, &mut j, hook)?;
@@ -675,14 +678,17 @@ pub fn approved_feed(
 ) -> Result<(String, Manifest)> {
     let j = load_journal(root)?.context("no World of Surf move is journalled")?;
     let p = meta(root, FEED)?;
+    let fix = format!(
+        "put it back from a backup, or delete {JOURNAL} and {PENDING} to update World of Surf as an ordinary install (the old exe then stays in {PARKED})"
+    );
     ensure!(
         regular_or_absent(&p)? && fs::metadata(&p)?.len() <= u::MAX_FEED as u64,
-        "the World of Surf move's approved feed is missing: {FEED}"
+        "the World of Surf move's approved feed is missing: {FEED}; {fix}"
     );
     let text = fs::read_to_string(&p).context("the move's approved feed is not UTF-8")?;
     ensure!(
         sha256_hex(text.as_bytes()) == j.feed_sha256,
-        "{FEED} is not the feed the World of Surf move approved"
+        "{FEED} is not the feed the World of Surf move approved; {fix}"
     );
     let m = u::decode(&text, public_key, allow_insecure, Identity::WorldOfSurf)?;
     ensure!(
@@ -732,9 +738,25 @@ pub fn awaits_update(root: &Path) -> Result<bool> {
     if pending_barrier(root)?.is_some() {
         return Ok(true);
     }
-    // A barrier deleted by hand: until installed.json names worldofsurf the update never ran.
-    Ok(read_journal(root)? == Some(Step::Marked)
-        && installed_game(root).as_deref() != Some("worldofsurf"))
+    let Some(j) = load_journal(root)? else {
+        return Ok(false);
+    };
+    // A barrier deleted by hand leaves the update pending until installed.json names worldofsurf
+    // or the ledger records the worldofsurf exe at or above the approved release (a later
+    // ordinary update can carry the ledger past it, and installed.json can go missing).
+    Ok(j.step == Step::Marked
+        && installed_game(root).as_deref() != Some("worldofsurf")
+        && !update_recorded(root, &j))
+}
+
+/// The ledger shows the move's update installed: the worldofsurf exe (a legacy ledger never has
+/// it; respelled() does not add it) and a version at or above the approved one.
+fn update_recorded(root: &Path, j: &Journal) -> bool {
+    let Ok(st) = u::load_state(root, Identity::WorldOfSurf) else {
+        return false;
+    };
+    st.files.contains_key(Identity::WorldOfSurf.exec())
+        && matches!((u::version(&st.version), u::version(&j.version)), (Ok(have), Ok(want)) if have >= want)
 }
 
 /// The game installed.json names, unverified (it only ever makes the move more careful); None
