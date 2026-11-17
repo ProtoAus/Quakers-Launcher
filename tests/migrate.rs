@@ -616,6 +616,11 @@ async fn refusals_change_nothing() {
         setup(&i.root);
         let lock = i.lock();
         let before = i.snapshot();
+        // the launcher asks check_start before downloading anything
+        assert!(
+            migrate::check_start(&i.root).is_err(),
+            "{name}: refused before the download"
+        );
         assert!(migrate::start(&lock).is_err(), "{name}");
         assert_eq!(i.snapshot(), before, "{name}");
     }
