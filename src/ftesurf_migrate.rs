@@ -373,8 +373,12 @@ fn roll_back(root: &Path) -> Result<()> {
     // An intent without its barrier is rolled back again at the next start, retrying these.
     ensure!(
         stuck.is_empty(),
-        "could not put {} back from {PARKED}; nothing else changed, and the next start tries again",
-        stuck.join(", ")
+        "could not put the old exe back: move {} (nothing else changed; the next start tries again)",
+        stuck
+            .iter()
+            .map(|name| format!("{PARKED}/{name}.parked back to {name}"))
+            .collect::<Vec<_>>()
+            .join(", and ")
     );
     let journal = meta(root, JOURNAL)?;
     fs::remove_file(&journal)?;
@@ -397,7 +401,11 @@ fn unmoved(root: &Path) -> Result<bool> {
 /// A failed park or rename: rolled back when nothing moved.
 fn not_moved(root: &Path, e: anyhow::Error) -> Result<()> {
     if unmoved(root)? {
-        roll_back(root)?;
+        if let Err(r) = roll_back(root) {
+            return Err(r).context(format!(
+                "moving ftesurf/ to worldofsurf/ failed ({e:#}), and so did undoing it"
+            ));
+        }
         return Err(e).context(
             "could not move ftesurf/ to worldofsurf/ (is a file in it in use?); nothing was changed: close the game and anything using its folder, then start again",
         );
@@ -650,7 +658,7 @@ pub fn resume_with(
         return Ok(false);
     }
     // The approved feed pins the move's update; once that is installed only clean-up is left.
-    if j.step < Step::Marked || barrier {
+    if j.step < Step::Marked || awaits_update(root)? {
         approved_feed(root, public_key, allow_insecure)?;
     }
     advance(root, &mut j, hook)?;
@@ -721,7 +729,25 @@ pub fn legacy_leftovers(root: &Path) -> Result<Vec<String>> {
 /// The move still waits for its update: the game is blocked and only a verified install of the
 /// worldofsurf feed lifts it.
 pub fn awaits_update(root: &Path) -> Result<bool> {
-    Ok(pending_barrier(root)?.is_some())
+    if pending_barrier(root)?.is_some() {
+        return Ok(true);
+    }
+    // A barrier deleted by hand: until installed.json names worldofsurf the update never ran.
+    Ok(read_journal(root)? == Some(Step::Marked)
+        && installed_game(root).as_deref() != Some("worldofsurf"))
+}
+
+/// The game installed.json names, unverified (it only ever makes the move more careful); None
+/// for a missing, linked, oversized or unreadable one.
+fn installed_game(root: &Path) -> Option<String> {
+    let p = meta(root, ".ftesurf-updater/installed.json").ok()?;
+    let md = u::inspect(&p).ok()??;
+    if !md.is_file() || u::is_link(&md) || md.len() > u::MAX_FEED as u64 {
+        return None;
+    }
+    let envelope: serde_json::Value = serde_json::from_str(&fs::read_to_string(&p).ok()?).ok()?;
+    let payload: serde_json::Value = serde_json::from_str(envelope["payload"].as_str()?).ok()?;
+    payload["game"].as_str().map(str::to_string)
 }
 
 /// One default.fmf line as the engine's tokenizer reads it, under updatefeed.py check_manifest's
@@ -911,7 +937,7 @@ pub async fn before_install(
 ) -> Result<()> {
     let root = lock.root();
     // Only the move's own update: a later feed's default.fmf must never hold the clean-up.
-    if pending_barrier(root)? != Some(Step::Marked) {
+    if read_journal(root)? != Some(Step::Marked) || !awaits_update(root)? {
         return Ok(());
     }
     if check_feed(root, staging, m, jobs).await? != NEW_CFG {

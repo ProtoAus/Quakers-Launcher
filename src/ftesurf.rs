@@ -285,7 +285,7 @@ async fn finish_move(
     match migrate::finish(lock, m).await {
         Ok(()) => ui::message("Moved to World of Surf.", "ftesurf/ is now worldofsurf/."),
         Err(e) => ui::message(
-            "World of Surf is installed; the old files are cleaned up next start.",
+            "The move to World of Surf has its clean-up left; the launcher tries it again every start.",
             &format!("{e:#}"),
         ),
     }
@@ -370,7 +370,7 @@ async fn run(a: &Args) -> Result<()> {
         match migrate::finish_installed(&lock, u::PUBLIC_KEY, a.allow_insecure).await {
             Ok(_) => ui::message("Moved to World of Surf.", "ftesurf/ is now worldofsurf/.")?,
             Err(e) => ui::message(
-                "World of Surf is installed; the old files are cleaned up next start.",
+                "The move to World of Surf has its clean-up left; the launcher tries it again every start.",
                 &format!("{e:#}"),
             )?,
         }

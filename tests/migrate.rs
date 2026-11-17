@@ -1426,7 +1426,14 @@ fn a_parked_exe_that_cannot_go_back_keeps_the_journal() {
         )))
         .unwrap();
     let e = resume(&lock).unwrap_err();
-    assert!(format!("{e:#}").contains("could not put"), "{e:#}");
+    let fix = format!(
+        ".ftesurf-updater/legacy/{0}.parked back to {0}",
+        Identity::Legacy.exec()
+    );
+    assert!(
+        format!("{e:#}").contains(&fix),
+        "names the manual fix: {e:#}"
+    );
     assert_eq!(migrate::read_journal(&i.root).unwrap(), Some(Step::Intent));
     assert!(!i.has_barrier());
     drop(held);
@@ -1455,4 +1462,68 @@ fn an_unreadable_leftover_is_named() {
     icacls(&["/remove:d", "*S-1-1-0"]);
     let e = got.unwrap_err();
     assert!(format!("{e:#}").contains("locked"), "{e:#}");
+}
+
+/// The reviewer's probe: the barrier deleted by hand after the move. Until installed.json names
+/// worldofsurf the move's update is still pending, so it runs with its cfg step.
+#[tokio::test]
+async fn a_barrier_deleted_by_hand_still_leaves_the_update_pending() {
+    let f = wos("worldofsurf");
+    let i = Install::legacy("lost-barrier", true);
+    let lock = i.lock();
+    start_feed(&lock, &f).unwrap();
+    assert_eq!(migrate::read_journal(&i.root).unwrap(), Some(Step::Marked));
+    fs::remove_file(i.root.join(".ftesurf-updater/pending.json")).unwrap();
+    assert!(resume(&lock).unwrap());
+    u::recover_with_key(&i.root, &f.key, false, Identity::WorldOfSurf)
+        .await
+        .unwrap();
+    assert!(migrate::awaits_update(&i.root).unwrap());
+    assert!(
+        !migrate::finish_installed(&lock, &f.key, false)
+            .await
+            .unwrap(),
+        "no clean-up yet"
+    );
+    update(&lock, &f, Identity::WorldOfSurf, Stop::No)
+        .await
+        .unwrap();
+    assert_moved(&i, "worldofsurf.cfg");
+}
+
+/// A rollback that fails keeps the error that made it roll back.
+#[cfg(windows)]
+#[test]
+fn a_failed_rollback_keeps_the_move_error() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let i = Install::legacy("rollback-context", true);
+    put(&i.root.join("ftesurf/logs/qconsole.log"), b"log");
+    let open = |p: &Path| {
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2) // no FILE_SHARE_DELETE
+            .open(p)
+            .unwrap()
+    };
+    let _game = open(&i.root.join("ftesurf/logs/qconsole.log")); // the rename fails
+    let parked = i.root.join(format!(
+        ".ftesurf-updater/legacy/{}.parked",
+        Identity::Legacy.exec()
+    ));
+    let mut held = None;
+    let lock = i.lock();
+    let e = start_with(&lock, &mut |p| {
+        if p == Point::Parked {
+            held = Some(open(&parked)); // and so does putting the exe back
+        }
+        Ok(())
+    })
+    .unwrap_err();
+    let msg = format!("{e:#}");
+    assert!(
+        msg.contains("failed (") && msg.contains("os error"),
+        "{msg}"
+    );
+    assert!(msg.contains(".parked back to"), "{msg}");
+    drop(held);
 }
