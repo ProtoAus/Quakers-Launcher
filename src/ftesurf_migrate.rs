@@ -1036,6 +1036,7 @@ mod tests {
             ("MAINCONFIG \"ftesurf\"x\n", None),
             ("MAINCONFIG ftesurf // don\"t\n", None),
             ("MAINCONFIG ftesurf // \"open\n", None),
+            ("MAINCONFIG ftesurf // a\"b\"c\n", None),
             (
                 "MAINCONFIG ftesurf\n-set url \"http://a/b\" // ok\n",
                 Some("ftesurf.cfg"),
