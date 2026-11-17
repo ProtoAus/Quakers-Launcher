@@ -678,22 +678,32 @@ pub fn approved_feed(
 ) -> Result<(String, Manifest)> {
     let j = load_journal(root)?.context("no World of Surf move is journalled")?;
     let p = meta(root, FEED)?;
-    let fix = format!(
-        "put it back from a backup, or delete {JOURNAL} and {PENDING} to update World of Surf as an ordinary install (the old exe then stays in {PARKED})"
-    );
+    // Dropping the journal is safe only once the marker says worldofsurf: before that the
+    // folders and the ledger are half moved, and only the move itself may finish them.
+    let fix = if j.step == Step::Marked {
+        format!(
+            "put {FEED} back from a backup, or delete {JOURNAL} and {PENDING} to update World of Surf as an ordinary install (the old exe then stays in {PARKED}, and worldofsurf/ftesurf.cfg is not renamed: copy it to worldofsurf/worldofsurf.cfg if the release's default.fmf says MAINCONFIG worldofsurf)"
+        )
+    } else {
+        format!(
+            "put {FEED} back from a backup and start again; the move is half done, so change nothing else by hand"
+        )
+    };
     ensure!(
         regular_or_absent(&p)? && fs::metadata(&p)?.len() <= u::MAX_FEED as u64,
         "the World of Surf move's approved feed is missing: {FEED}; {fix}"
     );
-    let text = fs::read_to_string(&p).context("the move's approved feed is not UTF-8")?;
+    let text = fs::read_to_string(&p)
+        .with_context(|| format!("the move's approved feed is not UTF-8; {fix}"))?;
     ensure!(
         sha256_hex(text.as_bytes()) == j.feed_sha256,
         "{FEED} is not the feed the World of Surf move approved; {fix}"
     );
-    let m = u::decode(&text, public_key, allow_insecure, Identity::WorldOfSurf)?;
+    let m = u::decode(&text, public_key, allow_insecure, Identity::WorldOfSurf)
+        .with_context(|| format!("{FEED} does not verify; {fix}"))?;
     ensure!(
         m.version == j.version,
-        "{FEED} is not the release the World of Surf move approved"
+        "{FEED} is not the release the World of Surf move approved; {fix}"
     );
     Ok((text, m))
 }

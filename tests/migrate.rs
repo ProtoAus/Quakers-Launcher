@@ -1601,14 +1601,73 @@ async fn an_update_begun_needs_no_approved_feed() {
 
 #[test]
 fn a_missing_approved_feed_names_the_fix() {
+    const DROP: &str = "delete .ftesurf-updater/migrate.json and .ftesurf-updater/pending.json";
+    const RESTORE: &str = "put .ftesurf-updater/move-feed.json back from a backup";
+    // at marked the journal may go, and the cfg left unrenamed is named
     let i = Install::legacy("feed-fix", true);
     let lock = i.lock();
     start(&lock).unwrap();
     fs::remove_file(i.root.join(migrate::FEED)).unwrap();
-    let e = resume(&lock).unwrap_err();
+    let e = format!("{:#}", resume(&lock).unwrap_err());
+    assert!(e.contains(RESTORE) && e.contains(DROP), "{e}");
     assert!(
-        format!("{e:#}")
-            .contains("delete .ftesurf-updater/migrate.json and .ftesurf-updater/pending.json"),
-        "{e:#}"
+        e.contains("copy it to worldofsurf/worldofsurf.cfg if the release's default.fmf says MAINCONFIG worldofsurf"),
+        "{e}"
+    );
+    // half moved: only the safe action, nothing destructive
+    let j = Install::legacy("feed-fix-early", true);
+    let lock = j.lock();
+    assert!(start_with(&lock, &mut stop_at(Point::Recorded(Step::Renamed))).is_err());
+    fs::remove_file(j.root.join(migrate::FEED)).unwrap();
+    let e = format!("{:#}", resume(&lock).unwrap_err());
+    assert!(
+        e.contains(RESTORE) && e.contains("change nothing else by hand"),
+        "{e}"
+    );
+    assert!(!e.contains("delete"), "{e}");
+}
+
+/// A copy that verifies against the journal's hash but not as a feed, or one of another release
+/// than the journal's, names the remedy too.
+#[test]
+fn every_approved_feed_error_names_the_remedy() {
+    use sha2::Digest;
+    let i = Install::legacy("feed-remedy", true);
+    let lock = i.lock();
+    start(&lock).unwrap();
+    let path = i.root.join(migrate::JOURNAL);
+    let journal: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let with = |key: &str, value: String| {
+        let mut j = journal.clone();
+        j[key] = value.into();
+        put(&path, &serde_json::to_vec(&j).unwrap());
+    };
+    let garbage = b"{\"payload\":\"{}\",\"signature\":\"00\"}";
+    put(&i.root.join(migrate::FEED), garbage);
+    with("feed_sha256", hex::encode(sha2::Sha256::digest(garbage)));
+    let e = format!(
+        "{:#}",
+        migrate::approved_feed(&i.root, &key(), false).unwrap_err()
+    );
+    assert!(
+        e.contains("does not verify") && e.contains("back from a backup"),
+        "{e}"
+    );
+    put(
+        &i.root.join(migrate::FEED),
+        wos("ftesurf").envelope.as_bytes(),
+    );
+    with(
+        "feed_sha256",
+        journal["feed_sha256"].as_str().unwrap().to_string(),
+    );
+    with("version", "0.1.50".into());
+    let e = format!(
+        "{:#}",
+        migrate::approved_feed(&i.root, &key(), false).unwrap_err()
+    );
+    assert!(
+        e.contains("not the release") && e.contains("back from a backup"),
+        "{e}"
     );
 }
