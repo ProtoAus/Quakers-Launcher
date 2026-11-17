@@ -264,18 +264,17 @@ async fn install_feed(
 
 /// P1593: a ftesurf/ that came back after the move may hold the player's last settings (an
 /// exiting engine saves its cfg after releasing the lock); said every start until it is gone.
+/// Best effort: an unreadable folder is named, never fatal (finish() still refuses on it).
 fn report_leftovers(root: &std::path::Path) -> Result<()> {
-    let left = migrate::legacy_leftovers(root)?;
-    if !left.is_empty() {
-        ui::message(
-            "ftesurf/ came back after the move to World of Surf.",
-            &format!(
-                "It holds {}. Move anything you want to keep into worldofsurf/, then delete ftesurf/.",
-                left.join(", ")
-            ),
-        )?;
-    }
-    Ok(())
+    let found = match migrate::legacy_leftovers(root) {
+        Ok(left) if left.is_empty() => return Ok(()),
+        Ok(left) => format!("It holds {}.", left.join(", ")),
+        Err(e) => format!("{e:#}."),
+    };
+    ui::message(
+        "ftesurf/ came back after the move to World of Surf.",
+        &format!("{found} Move anything you want to keep into worldofsurf/, then delete ftesurf/."),
+    )
 }
 
 /// The install verified, so a failed clean-up (the old exe in use) only waits for the next start.
@@ -365,6 +364,18 @@ async fn run(a: &Args) -> Result<()> {
         report_leftovers(&root)?;
     }
     u::recover(&root, a.allow_insecure, id).await?;
+    // P1593 stage 2: a move with only its clean-up left finishes now, from the installed release
+    // (offline too), so no later feed can hold it; it is retried every start until it succeeds.
+    if moving && !migrate::awaits_update(&root)? {
+        match migrate::finish_installed(&lock, u::PUBLIC_KEY, a.allow_insecure).await {
+            Ok(_) => ui::message("Moved to World of Surf.", "ftesurf/ is now worldofsurf/.")?,
+            Err(e) => ui::message(
+                "World of Surf is installed; the old files are cleaned up next start.",
+                &format!("{e:#}"),
+            )?,
+        }
+        moving = false;
+    }
     let ingame_journal = u::checked_path(&root, ".ftesurf-updater/ingame/journal.json", id)?;
     let ingame_pending = ingame_journal.exists();
     let consent = u::checked_path(&root, ".ftesurf-updater/consent", id)?;
@@ -582,7 +593,7 @@ async fn run(a: &Args) -> Result<()> {
                     old,
                     &jobs,
                     id,
-                    moving,
+                    false, // a move's own update ran above; its clean-up ran after recovery
                 )
                 .await?;
                 if ingame_pending {
@@ -629,9 +640,6 @@ async fn run(a: &Args) -> Result<()> {
                     u::check_complete(&root, &m, id).await?;
                 } else {
                     u::prepare_install(&root, &m, id).await?;
-                    if moving {
-                        finish_move(&lock, &m).await?;
-                    }
                 }
                 launch_manifest = Some(m);
             }

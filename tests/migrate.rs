@@ -346,13 +346,14 @@ fn resume(lock: &InstallLock) -> Result<bool> {
     migrate::resume(lock, &key(), false)
 }
 
-/// The launcher's update path (ftesurf.rs run() and install_feed): while the move waits for its
-/// update, the approved feed from FEED, else the fetched one; plan, stage what the download would,
-/// before_install, begin + recover (or adopt), check_complete, finish, establish_identity.
+/// The launcher's update path (ftesurf.rs run() and install_feed): the move's own update (its
+/// barrier up) installs the approved feed from FEED with before_install and finish; any other
+/// update is the fetched feed alone. Plan, stage what the download would, begin + recover (or
+/// adopt), check_complete, establish_identity.
 async fn update(lock: &InstallLock, f: &Feed, id: Identity, stop: Stop) -> Result<()> {
     let root = lock.root();
-    let moving = migrate::read_journal(root)?.is_some();
-    let (envelope, m) = if moving && migrate::awaits_update(root)? {
+    let moving = migrate::read_journal(root)?.is_some() && migrate::awaits_update(root)?;
+    let (envelope, m) = if moving {
         migrate::approved_feed(root, &f.key, false)?
     } else {
         (
@@ -438,7 +439,10 @@ async fn next_start(i: &Install, f: &Feed) -> Result<bool> {
     let id = u::install_identity(&i.root)?;
     assert_eq!(id, Identity::WorldOfSurf);
     u::recover_with_key(&i.root, &f.key, false, id).await?;
-    if migrate::read_journal(&i.root)?.is_some() {
+    // run(): clean-up first when only that is left, else the move's own update
+    if !migrate::finish_installed(&lock, &f.key, false).await?
+        && migrate::read_journal(&i.root)?.is_some()
+    {
         update(&lock, f, id, Stop::No).await?;
     }
     Ok(resumed)
@@ -558,6 +562,7 @@ async fn every_crash_point_resumes_to_the_same_install() {
     let points = [
         Point::Recorded(Step::Intent),
         Point::Barrier,
+        Point::Parked,
         Point::Done(Step::Renamed),
         Point::Recorded(Step::Renamed),
         Point::Done(Step::Ledger),
@@ -1320,4 +1325,134 @@ async fn legacy_exes_are_parked_and_only_the_known_ones_deleted() {
         j.read(migrate::JOURNAL).is_none(),
         "the move still finishes"
     );
+}
+
+/// Finish held by a recreated ftesurf/, then a later release whose default.fmf the move's own
+/// checks would refuse: once the folder is gone the clean-up finishes from the installed release,
+/// with no feed and no network, and the later release installs as an ordinary update.
+#[tokio::test]
+async fn a_later_feed_never_holds_the_clean_up() {
+    let f = wos("ftesurf");
+    let later = feed(
+        Identity::WorldOfSurf,
+        "0.1.50",
+        "ftesurf\nDISABLEHOMEDIR 0",
+        TEST_SEED,
+    );
+    let i = Install::legacy("later", true);
+    let lock = i.lock();
+    move_install(&lock, &f).await.unwrap();
+    put(&i.root.join("ftesurf/ftesurf.cfg"), b"late save\n");
+    assert!(update(&lock, &f, Identity::WorldOfSurf, Stop::No)
+        .await
+        .is_err());
+    assert!(!i.has_barrier() && migrate::read_journal(&i.root).unwrap() == Some(Step::Marked));
+    // only clean-up is left: nothing needs the approved feed any more
+    fs::remove_file(i.root.join(migrate::FEED)).unwrap();
+    assert!(resume(&lock).unwrap());
+    // the move's checks are off for any update but its own
+    let m = u::decode(&later.envelope, &later.key, false, Identity::WorldOfSurf).unwrap();
+    let st = u::load_state(&i.root, Identity::WorldOfSurf).unwrap();
+    let (jobs, _) = u::plan(&m, &i.root, &st, Identity::WorldOfSurf)
+        .await
+        .unwrap();
+    let staging = i.root.join(".ftesurf-updater/download");
+    for j in &jobs {
+        put(&staging.join(&j.path), &later.contents[&j.path]);
+    }
+    assert!(migrate::check_feed(&i.root, &staging, &m, &jobs)
+        .await
+        .is_err());
+    migrate::before_install(&lock, &staging, &m, &jobs)
+        .await
+        .unwrap();
+    // held while ftesurf/ holds anything; done from installed.json once it is gone
+    assert!(migrate::finish_installed(&lock, &key(), false)
+        .await
+        .is_err());
+    fs::remove_dir_all(i.root.join("ftesurf")).unwrap();
+    assert!(migrate::finish_installed(&lock, &key(), false)
+        .await
+        .unwrap());
+    assert!(i.read(migrate::JOURNAL).is_none());
+    assert!(!migrate::finish_installed(&lock, &key(), false)
+        .await
+        .unwrap());
+    update(&lock, &later, Identity::WorldOfSurf, Stop::No)
+        .await
+        .unwrap();
+    assert_eq!(
+        u::load_state(&i.root, Identity::WorldOfSurf)
+            .unwrap()
+            .version,
+        "0.1.50"
+    );
+}
+
+#[tokio::test]
+async fn an_unmoved_intent_with_an_unusable_feed_rolls_back() {
+    let i = Install::legacy("unusable", true);
+    let lock = i.lock();
+    let before = i.snapshot();
+    assert!(start_with(&lock, &mut stop_at(Point::Parked)).is_err());
+    assert!(i.has_barrier() && parked(&i, Identity::Legacy.exec()).is_some());
+    fs::remove_file(i.root.join(migrate::FEED)).unwrap();
+    assert!(!resume(&lock).unwrap(), "rolled back, not refused");
+    assert_eq!(
+        i.snapshot(),
+        before,
+        "the exe is back, nothing else remains"
+    );
+    assert!(migrate::eligible(&i.root).unwrap(), "offered again");
+}
+
+/// A rollback that cannot put a parked exe back keeps the journal (without its barrier), so the
+/// next start rolls back again instead of losing track of the exe.
+#[cfg(windows)]
+#[test]
+fn a_parked_exe_that_cannot_go_back_keeps_the_journal() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let i = Install::legacy("stuck", true);
+    let lock = i.lock();
+    let before = i.snapshot();
+    assert!(start_with(&lock, &mut stop_at(Point::Parked)).is_err());
+    fs::remove_file(i.root.join(migrate::FEED)).unwrap();
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x1 | 0x2) // no FILE_SHARE_DELETE
+        .open(i.root.join(format!(
+            ".ftesurf-updater/legacy/{}.parked",
+            Identity::Legacy.exec()
+        )))
+        .unwrap();
+    let e = resume(&lock).unwrap_err();
+    assert!(format!("{e:#}").contains("could not put"), "{e:#}");
+    assert_eq!(migrate::read_journal(&i.root).unwrap(), Some(Step::Intent));
+    assert!(!i.has_barrier());
+    drop(held);
+    assert!(!resume(&lock).unwrap());
+    assert_eq!(i.snapshot(), before);
+}
+
+/// legacy_leftovers names a folder it cannot read (finish refuses on it; the launcher only warns).
+#[cfg(windows)]
+#[test]
+fn an_unreadable_leftover_is_named() {
+    let i = Install::legacy("unreadable", true);
+    let sub = i.root.join("ftesurf/locked");
+    put(&sub.join("x.cfg"), b"x");
+    let icacls = |args: &[&str]| {
+        assert!(std::process::Command::new("icacls")
+            .arg(&sub)
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success())
+    };
+    icacls(&["/deny", "*S-1-1-0:(RD)"]); // Everyone: no listing
+    let got = migrate::legacy_leftovers(&i.root);
+    icacls(&["/remove:d", "*S-1-1-0"]);
+    let e = got.unwrap_err();
+    assert!(format!("{e:#}").contains("locked"), "{e:#}");
 }

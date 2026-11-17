@@ -56,6 +56,8 @@ pub enum Step {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Point {
     Barrier,
+    /// the legacy exes parked, ftesurf/ not yet renamed
+    Parked,
     Done(Step),
     Recorded(Step),
     BarrierRemoved,
@@ -324,23 +326,29 @@ fn park_exes(root: &Path) -> Result<()> {
 }
 
 /// Best effort, for a rollback that must not strand the intent: an exe still in the root (never
-/// moved) is left alone without touching PARKED at all.
-fn unpark_exes(root: &Path) {
+/// moved) is left alone without touching PARKED at all. Returns the exes left parked.
+fn unpark_exes(root: &Path) -> Vec<&'static str> {
+    let mut stuck = Vec::new();
     for name in Identity::Legacy.exes() {
         let exe = root.join(name);
         if !matches!(u::inspect(&exe), Ok(None)) {
             continue;
         }
         if let Ok(parked) = parked_exe(root, name) {
-            if matches!(regular_or_absent(&parked), Ok(true)) && fs::rename(&parked, &exe).is_ok() {
-                let _ = set_exec(&exe, true);
-                let _ = u::sync_dir(root);
+            if matches!(regular_or_absent(&parked), Ok(true)) {
+                if fs::rename(&parked, &exe).is_ok() {
+                    let _ = set_exec(&exe, true);
+                    let _ = u::sync_dir(root);
+                } else {
+                    stuck.push(name);
+                }
             }
         }
     }
     if let Ok(dir) = meta(root, PARKED) {
         let _ = fs::remove_dir(dir); // only when empty
     }
+    stuck
 }
 
 fn ensure_barrier(root: &Path) -> Result<()> {
@@ -358,10 +366,16 @@ fn ensure_barrier(root: &Path) -> Result<()> {
 /// launcher asks again next time. A pending.json that is not BARRIER (an older launcher's
 /// update) is left for recover().
 fn roll_back(root: &Path) -> Result<()> {
-    unpark_exes(root);
+    let stuck = unpark_exes(root);
     if pending_barrier(root)?.is_some() {
         fs::remove_file(meta(root, PENDING)?)?;
     }
+    // An intent without its barrier is rolled back again at the next start, retrying these.
+    ensure!(
+        stuck.is_empty(),
+        "could not put {} back from {PARKED}; nothing else changed, and the next start tries again",
+        stuck.join(", ")
+    );
     let journal = meta(root, JOURNAL)?;
     fs::remove_file(&journal)?;
     u::sync_dir(journal.parent().unwrap())?;
@@ -380,7 +394,20 @@ fn unmoved(root: &Path) -> Result<bool> {
         ))
 }
 
-fn rename(root: &Path) -> Result<()> {
+/// A failed park or rename: rolled back when nothing moved.
+fn not_moved(root: &Path, e: anyhow::Error) -> Result<()> {
+    if unmoved(root)? {
+        roll_back(root)?;
+        return Err(e).context(
+            "could not move ftesurf/ to worldofsurf/ (is a file in it in use?); nothing was changed: close the game and anything using its folder, then start again",
+        );
+    }
+    Err(e).context(format!(
+        "moving ftesurf/ to worldofsurf/ failed part-way; the move is journalled in {JOURNAL}"
+    ))
+}
+
+fn rename(root: &Path, hook: &mut dyn FnMut(Point) -> Result<()>) -> Result<()> {
     let (old, new) = (
         gamedir_path(root, Identity::Legacy),
         gamedir_path(root, Identity::WorldOfSurf),
@@ -397,23 +424,18 @@ fn rename(root: &Path) -> Result<()> {
             "cannot move ftesurf/ ({l:?}) to worldofsurf/ ({w:?}); the move is journalled in {JOURNAL}; inspect both folders before starting"
         ),
     }
+    if let Err(e) = park_exes(root) {
+        return not_moved(root, e);
+    }
+    hook(Point::Parked)?;
     // Windows cannot rename onto a folder, so an empty one goes first everywhere.
-    let moved = park_exes(root)
-        .and_then(|()| match w {
-            Dir::Empty => fs::remove_dir(&new).map_err(Into::into),
-            _ => Ok(()),
-        })
-        .and_then(|()| fs::rename(&old, &new).map_err(Into::into));
+    let moved = match w {
+        Dir::Empty => fs::remove_dir(&new).map_err(anyhow::Error::from),
+        _ => Ok(()),
+    }
+    .and_then(|()| fs::rename(&old, &new).map_err(Into::into));
     if let Err(e) = moved {
-        if unmoved(root)? {
-            roll_back(root)?;
-            return Err(e).context(
-                "could not move ftesurf/ to worldofsurf/ (is a file in it in use?); nothing was changed: close the game and anything using its folder, then start again",
-            );
-        }
-        return Err(e).context(format!(
-            "moving ftesurf/ to worldofsurf/ failed part-way; the move is journalled in {JOURNAL}"
-        ));
+        return not_moved(root, e);
     }
     u::sync_dir(root)
 }
@@ -531,7 +553,7 @@ fn advance(root: &Path, j: &mut Journal, hook: &mut dyn FnMut(Point) -> Result<(
         hook(Point::Barrier)?;
     }
     if j.step == Step::Intent {
-        rename(root)?;
+        rename(root, hook)?;
         hook(Point::Done(Step::Renamed))?;
         record(root, j, Step::Renamed, hook)?;
     }
@@ -616,12 +638,21 @@ pub fn resume_with(
     let Some(mut j) = load_journal(root)? else {
         return Ok(false);
     };
-    // The barrier follows the intent record, and the rename follows the barrier.
-    if j.step == Step::Intent && pending_barrier(root)?.is_none() && unmoved(root)? {
+    let barrier = pending_barrier(root)?.is_some();
+    // Nothing moved yet: an intent without its barrier never started (the barrier follows the
+    // intent record, the rename the barrier), and one whose approved feed is unusable cannot go
+    // on. Both roll back; the launcher asks again.
+    if j.step == Step::Intent
+        && unmoved(root)?
+        && (!barrier || approved_feed(root, public_key, allow_insecure).is_err())
+    {
         roll_back(root)?;
         return Ok(false);
     }
-    approved_feed(root, public_key, allow_insecure)?;
+    // The approved feed pins the move's update; once that is installed only clean-up is left.
+    if j.step < Step::Marked || barrier {
+        approved_feed(root, public_key, allow_insecure)?;
+    }
     advance(root, &mut j, hook)?;
     Ok(true)
 }
@@ -665,9 +696,10 @@ pub fn legacy_leftovers(root: &Path) -> Result<Vec<String>> {
     }
     let (mut out, mut todo) = (Vec::new(), vec![dir.clone()]);
     while let Some(d) = todo.pop() {
-        for e in fs::read_dir(&d)? {
-            let p = e?.path();
-            let md = fs::symlink_metadata(&p)?;
+        let unreadable = || format!("cannot look inside {}", d.display());
+        for e in fs::read_dir(&d).with_context(unreadable)? {
+            let p = e.with_context(unreadable)?.path();
+            let md = fs::symlink_metadata(&p).with_context(unreadable)?;
             out.push(
                 p.strip_prefix(root)
                     .unwrap()
@@ -878,10 +910,10 @@ pub async fn before_install(
     jobs: &[FileEntry],
 ) -> Result<()> {
     let root = lock.root();
-    ensure!(
-        read_journal(root)? == Some(Step::Marked),
-        "no World of Surf move is waiting for its update"
-    );
+    // Only the move's own update: a later feed's default.fmf must never hold the clean-up.
+    if pending_barrier(root)? != Some(Step::Marked) {
+        return Ok(());
+    }
     if check_feed(root, staging, m, jobs).await? != NEW_CFG {
         return Ok(());
     }
@@ -900,6 +932,33 @@ pub async fn before_install(
 /// took; then the journal. A legacy exe that does not match is left where it is.
 pub async fn finish(lock: &InstallLock, m: &Manifest) -> Result<()> {
     finish_with(lock, m, &mut |_| Ok(())).await
+}
+
+/// A move with only its clean-up left (its update installed, no barrier) finishes from the
+/// release installed.json verifies, before any fetch: no network, and no later feed involved.
+/// Ok(false) when there is no such move.
+pub async fn finish_installed(
+    lock: &InstallLock,
+    public_key: &str,
+    allow_insecure: bool,
+) -> Result<bool> {
+    let root = lock.root();
+    if read_journal(root)? != Some(Step::Marked) || awaits_update(root)? {
+        return Ok(false);
+    }
+    let cached = meta(root, ".ftesurf-updater/installed.json")?;
+    ensure!(
+        regular_or_absent(&cached)?,
+        "no verified World of Surf install is recorded yet"
+    );
+    let m = u::decode(
+        &fs::read_to_string(&cached)?,
+        public_key,
+        allow_insecure,
+        Identity::WorldOfSurf,
+    )?;
+    finish(lock, &m).await?;
+    Ok(true)
 }
 
 pub async fn finish_with(
