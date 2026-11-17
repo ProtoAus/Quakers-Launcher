@@ -1200,6 +1200,10 @@ async fn the_move_installs_only_the_release_it_approved() {
     for (name, bytes) in [
         ("another signed release", Some(newer.into_bytes())),
         (
+            "another signed feed of the same version",
+            Some(wos("worldofsurf").envelope.into_bytes()),
+        ),
+        (
             "a damaged copy",
             Some(approved[..approved.len() - 1].to_vec()),
         ),
