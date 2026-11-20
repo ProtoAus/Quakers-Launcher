@@ -40,7 +40,11 @@ pub fn decode(text: &str, public_key: &str, allow_insecure: bool) -> Result<Mani
         .context("update manifest signature is invalid")?;
     let value: serde_json::Value = serde_json::from_str(&e.payload)?;
     ensure!(value["game"] == "ftesurf", "not an FTESurf update");
-    let m: Manifest = serde_json::from_value(value)?;
+    let mut m: Manifest = serde_json::from_value(value)?;
+    // P1668: "files_ext" holds paths older launchers do not manage; from here on they are ordinary entries and every
+    // check below (policy, duplicates, sizes, overlap, totals) covers them.
+    let ext = std::mem::take(&mut m.files_ext);
+    m.files.extend(ext);
     ensure!(
         m.schema == 2 && m.hash_algo == "blake2b-256",
         "unsupported update format"
@@ -202,6 +206,7 @@ pub fn managed(p: &str) -> bool {
             | "fteplug_hl2_x64.dll"
             | "fteplug_ui_imgui_x64.dll"
             | "fteplug_hl2_amd64.so"
+            | "fteplug_ui_imgui_amd64.so" // P1668: only ever in "files_ext" (readers before 0.1.7 refuse it in "files")
     ) {
         return true;
     }
@@ -644,6 +649,67 @@ mod tests {
     fn versions_are_numeric_not_lexical() {
         assert!(version("0.1.100").unwrap() > version("0.1.99").unwrap());
         assert!(version("0.1.2/../../x").is_err());
+    }
+    /// P1668: a feed signed with the RFC 8032 test key (never the release key), checked with that key.
+    fn signed_feed(extra: serde_json::Value) -> (String, String) {
+        use ed25519_dalek::{Signer, SigningKey};
+        let key = SigningKey::from_bytes(
+            &hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        let h = |c: char| c.to_string().repeat(64);
+        let mut files = vec![];
+        for (path, plat) in [
+            ("default.fmf", "all"),
+            ("ftesurf/csprogs.dat", "all"),
+            ("ftesurf/qwprogs.dat", "all"),
+            ("ftesurf/menu.dat", "all"),
+            ("ftesurf64", "linux64"),
+            ("ftesurf64.exe", "win64"),
+        ] {
+            files.push(serde_json::json!({"path": path, "hash": h('a'), "size": 1, "platform": plat, "exec": false}));
+        }
+        let mut payload = serde_json::json!({
+            "schema": 2, "hash_algo": "blake2b-256", "game": "ftesurf", "channel": "stable", "version": "0.1.53",
+            "object_layout": "objects/{h0h1}/{hash}", "mirrors": ["https://dl.proto.bar/ftesurf/update"],
+            "files": files, "removed": [],
+            "exec": {"cmd": "ftesurf64.exe", "args": ["-manifest", "default.fmf"]},
+            "exec_by_platform": {"win64": {"cmd": "ftesurf64.exe", "args": ["-manifest", "default.fmf"]},
+                                 "linux64": {"cmd": "ftesurf64", "args": ["-manifest", "default.fmf"]}}
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            payload[k] = v.clone();
+        }
+        let text = payload.to_string();
+        let env = serde_json::json!({"payload": text, "signature": hex::encode(key.sign(text.as_bytes()).to_bytes())});
+        (env.to_string(), hex::encode(key.verifying_key().to_bytes()))
+    }
+    #[test]
+    fn files_ext_entries_are_installed_like_files() {
+        let so = serde_json::json!({"path": "fteplug_ui_imgui_amd64.so", "hash": "b".repeat(64), "size": 7,
+                                    "platform": "linux64", "exec": false});
+        let (env, key) = signed_feed(serde_json::json!({"files_ext": [so]}));
+        let m = decode(&env, &key, false).unwrap();
+        assert!(m.files_ext.is_empty());
+        let mine: Vec<_> = m.files_for_platform().map(|f| f.path.as_str()).collect();
+        assert_eq!(mine.contains(&"fteplug_ui_imgui_amd64.so"), cfg!(target_os = "linux"));
+        // a feed without the key is the old one, unchanged
+        let (env, key) = signed_feed(serde_json::json!({}));
+        assert!(decode(&env, &key, false).is_ok());
+        // the key is still signed policy: an unmanaged path, a repeat of a "files" path, or a size past the limit refuse
+        for bad in [
+            serde_json::json!({"path": "ftesurf/data/consent.txt", "hash": "b".repeat(64), "size": 1, "platform": "all"}),
+            serde_json::json!({"path": "ftesurf/menu.dat", "hash": "b".repeat(64), "size": 1, "platform": "all"}),
+            serde_json::json!({"path": "fteplug_ui_imgui_amd64.so", "hash": "b".repeat(64), "size": 33 * 1024 * 1024,
+                               "platform": "linux64"}),
+            serde_json::json!({"path": "fteplug_ui_imgui_amd64.so", "hash": "B".repeat(64), "size": 1, "platform": "linux64"}),
+        ] {
+            let (env, key) = signed_feed(serde_json::json!({"files_ext": [bad.clone()]}));
+            assert!(decode(&env, &key, false).is_err(), "{bad}");
+        }
+        assert!(managed("fteplug_ui_imgui_amd64.so"));
     }
     #[test]
     fn signature_is_required() {

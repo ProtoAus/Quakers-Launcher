@@ -66,6 +66,10 @@ pub struct Manifest {
     #[serde(default)]
     pub removed: Vec<String>,
     pub files: Vec<FileEntry>,
+    /// FTESurf P1668: entries only a launcher that knows their paths may read (launchers before 0.1.7 ignore this
+    /// key, so a new managed path here never makes them refuse the whole feed). Merged into `files` by decode().
+    #[serde(default)]
+    pub files_ext: Vec<FileEntry>,
 }
 
 fn default_layout() -> String {
