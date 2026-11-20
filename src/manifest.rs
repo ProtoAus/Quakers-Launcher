@@ -66,6 +66,10 @@ pub struct Manifest {
     #[serde(default)]
     pub removed: Vec<String>,
     pub files: Vec<FileEntry>,
+    /// FTESurf P1668: entries only a launcher that knows their paths may read (launchers before 0.1.7 ignore this
+    /// key, so a new managed path here never makes them refuse the whole feed). Merged into `files` by decode().
+    #[serde(default)]
+    pub files_ext: Vec<FileEntry>,
 }
 
 fn default_layout() -> String {
@@ -94,6 +98,10 @@ pub struct FileEntry {
     /// Needs the executable bit on unix (the engine binaries). Ignored on Windows.
     #[serde(default)]
     pub exec: bool,
+    /// FTESurf P1668: came from "files_ext" (set by decode, never read from the feed). A journal written by an older
+    /// launcher, or an offline start, may lack it; the next online pass installs it.
+    #[serde(skip)]
+    pub ext: bool,
 }
 
 fn default_platform() -> String {

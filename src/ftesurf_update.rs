@@ -385,7 +385,14 @@ pub fn decode(
         id.game()
     );
     let removed_empty = value["removed"].as_array().is_some_and(|r| r.is_empty());
-    let m: Manifest = serde_json::from_value(value)?;
+    let mut m: Manifest = serde_json::from_value(value)?;
+    // P1668: "files_ext" holds paths older launchers do not manage; from here on they are ordinary entries and every
+    // check below (policy, duplicates, sizes, overlap, totals) covers them.
+    let mut ext = std::mem::take(&mut m.files_ext);
+    for f in &mut ext {
+        f.ext = true;
+    }
+    m.files.extend(ext);
     ensure!(
         m.schema == 2 && m.hash_algo == "blake2b-256",
         "unsupported update format"
@@ -560,6 +567,7 @@ fn managed_legacy(p: &str) -> bool {
             | "fteplug_hl2_x64.dll"
             | "fteplug_ui_imgui_x64.dll"
             | "fteplug_hl2_amd64.so"
+            | "fteplug_ui_imgui_amd64.so" // P1668: only ever in "files_ext" (readers before 0.1.7 refuse it in "files")
     ) {
         return true;
     }
@@ -891,6 +899,9 @@ pub async fn recover_with_key(
     let staged_root = checked_path(root, ".ftesurf-updater/download", id)?;
     let mut moves = Vec::new();
     for f in &jobs {
+        if f.ext && !seen.contains(f.path.as_str()) {
+            continue; // P1668: a journal from a launcher before 0.1.7; the next online pass installs it
+        }
         ensure!(
             seen.contains(f.path.as_str()),
             "journal omits required repair: {}",
@@ -930,7 +941,9 @@ pub async fn recover_with_key(
         fs::create_dir_all(dest.parent().unwrap())?;
         fs::rename(src, &dest)?;
     }
-    prepare_install(root, &m, id).await?;
+    let mut core = m.clone();
+    core.files.retain(|f| !f.ext || seen.contains(f.path.as_str()));
+    prepare_install(root, &core, id).await?;
     for f in m.files_for_platform() {
         if matches(root, f, id).await? {
             st.files.insert(f.path.clone(), f.hash.clone());
@@ -940,6 +953,20 @@ pub async fn recover_with_key(
     write_meta(root, "state.json", &serde_json::to_vec_pretty(&st)?, id)?;
     write_meta(root, "installed.json", j.envelope.as_bytes(), id)?;
     fs::remove_file(pending)?;
+    Ok(())
+}
+
+/// P1668: an offline start from a cached feed holding "files_ext" entries this install never received (the cache was
+/// written by an older launcher or by the engine). An absent one is left out; a present one is still verified, so a
+/// stale plugin beside a newer engine refuses as any wrong file does.
+pub fn without_absent_ext(root: &Path, m: &mut Manifest, id: Identity) -> Result<()> {
+    let mut keep = Vec::new();
+    for f in std::mem::take(&mut m.files) {
+        if !f.ext || checked_path(root, &f.path, id)?.exists() {
+            keep.push(f);
+        }
+    }
+    m.files = keep;
     Ok(())
 }
 
@@ -1062,6 +1089,89 @@ mod tests {
     fn versions_are_numeric_not_lexical() {
         assert!(version("0.1.100").unwrap() > version("0.1.99").unwrap());
         assert!(version("0.1.2/../../x").is_err());
+    }
+    /// P1668: a feed signed with the RFC 8032 test key (never the release key), checked with that key.
+    fn signed_feed(extra: serde_json::Value) -> (String, String) {
+        use ed25519_dalek::{Signer, SigningKey};
+        let key = SigningKey::from_bytes(
+            &hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        let h = |c: char| c.to_string().repeat(64);
+        let mut files = vec![];
+        for (path, plat) in [
+            ("default.fmf", "all"),
+            ("ftesurf/csprogs.dat", "all"),
+            ("ftesurf/qwprogs.dat", "all"),
+            ("ftesurf/menu.dat", "all"),
+            ("ftesurf64", "linux64"),
+            ("ftesurf64.exe", "win64"),
+        ] {
+            files.push(serde_json::json!({"path": path, "hash": h('a'), "size": 1, "platform": plat, "exec": false}));
+        }
+        let mut payload = serde_json::json!({
+            "schema": 2, "hash_algo": "blake2b-256", "game": "ftesurf", "channel": "stable", "version": "0.1.53",
+            "object_layout": "objects/{h0h1}/{hash}", "mirrors": ["https://dl.proto.bar/ftesurf/update"],
+            "files": files, "removed": [],
+            "exec": {"cmd": "ftesurf64.exe", "args": ["-manifest", "default.fmf"]},
+            "exec_by_platform": {"win64": {"cmd": "ftesurf64.exe", "args": ["-manifest", "default.fmf"]},
+                                 "linux64": {"cmd": "ftesurf64", "args": ["-manifest", "default.fmf"]}}
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            payload[k] = v.clone();
+        }
+        let text = payload.to_string();
+        let env = serde_json::json!({"payload": text, "signature": hex::encode(key.sign(text.as_bytes()).to_bytes())});
+        (env.to_string(), hex::encode(key.verifying_key().to_bytes()))
+    }
+    #[test]
+    fn files_ext_entries_are_installed_like_files() {
+        let so = serde_json::json!({"path": "fteplug_ui_imgui_amd64.so", "hash": "b".repeat(64), "size": 7,
+                                    "platform": "linux64", "exec": false});
+        let (env, key) = signed_feed(serde_json::json!({"files_ext": [so]}));
+        let m = decode(&env, &key, false, Identity::Legacy).unwrap();
+        assert!(m.files_ext.is_empty());
+        let mine: Vec<_> = m.files_for_platform().map(|f| f.path.as_str()).collect();
+        assert_eq!(mine.contains(&"fteplug_ui_imgui_amd64.so"), cfg!(target_os = "linux"));
+        // a feed without the key is the old one, unchanged
+        let (env, key) = signed_feed(serde_json::json!({}));
+        assert!(decode(&env, &key, false, Identity::Legacy).is_ok());
+        // the key is still signed policy: an unmanaged path, a repeat of a "files" path, or a size past the limit refuse
+        for bad in [
+            serde_json::json!({"path": "ftesurf/data/consent.txt", "hash": "b".repeat(64), "size": 1, "platform": "all"}),
+            serde_json::json!({"path": "ftesurf/menu.dat", "hash": "b".repeat(64), "size": 1, "platform": "all"}),
+            serde_json::json!({"path": "fteplug_ui_imgui_amd64.so", "hash": "b".repeat(64), "size": 33 * 1024 * 1024,
+                               "platform": "linux64"}),
+            serde_json::json!({"path": "fteplug_ui_imgui_amd64.so", "hash": "B".repeat(64), "size": 1, "platform": "linux64"}),
+        ] {
+            let (env, key) = signed_feed(serde_json::json!({"files_ext": [bad.clone()]}));
+            assert!(decode(&env, &key, false, Identity::Legacy).is_err(), "{bad}");
+        }
+        assert!(managed("fteplug_ui_imgui_amd64.so", Identity::Legacy));
+        assert!(managed("fteplug_ui_imgui_amd64.so", Identity::WorldOfSurf));
+    }
+    #[test]
+    fn offline_start_leaves_out_only_an_absent_ext_entry() {
+        let so = serde_json::json!({"path": "fteplug_ui_imgui_amd64.so", "hash": "b".repeat(64), "size": 7,
+                                    "platform": "linux64", "exec": false});
+        let (env, key) = signed_feed(serde_json::json!({"files_ext": [so]}));
+        let m = decode(&env, &key, false, Identity::Legacy).unwrap();
+        assert_eq!(m.files.iter().filter(|f| f.ext).count(), 1);
+        assert!(m.files.iter().filter(|f| !f.ext).all(|f| f.path != "fteplug_ui_imgui_amd64.so"));
+        let root = std::env::temp_dir().join(format!("p1668-offline-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut absent = m.clone();
+        without_absent_ext(&root, &mut absent, Identity::Legacy).unwrap();
+        assert!(absent.files.iter().all(|f| !f.ext));
+        assert_eq!(absent.files.len(), m.files.len() - 1);
+        fs::write(root.join("fteplug_ui_imgui_amd64.so"), b"stale").unwrap();
+        let mut present = m.clone();
+        without_absent_ext(&root, &mut present, Identity::Legacy).unwrap();
+        assert_eq!(present.files.len(), m.files.len()); // still verified, so a stale plugin refuses
+        fs::remove_dir_all(&root).unwrap();
     }
     #[test]
     fn signature_is_required() {

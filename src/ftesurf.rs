@@ -630,12 +630,13 @@ async fn run(a: &Args) -> Result<()> {
                 )?;
                 let cached = u::checked_path(&root, ".ftesurf-updater/installed.json", id)?;
                 ensure!(cached.is_file(), "no verified installation is cached yet; --offline explicitly starts an existing archive installation");
-                let m = u::decode(
+                let mut m = u::decode(
                     &fs::read_to_string(cached)?,
                     u::PUBLIC_KEY,
                     a.allow_insecure,
                     id,
                 )?;
+                u::without_absent_ext(&root, &mut m, id)?; // P1668: a plugin this install never received
                 if a.dry_run {
                     u::check_complete(&root, &m, id).await?;
                 } else {

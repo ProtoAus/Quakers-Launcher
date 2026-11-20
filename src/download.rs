@@ -1083,6 +1083,7 @@ mod tests {
             component: String::new(),
             platform: "all".to_string(),
             exec: false,
+            ext: false,
         }
     }
 
