@@ -98,6 +98,10 @@ pub struct FileEntry {
     /// Needs the executable bit on unix (the engine binaries). Ignored on Windows.
     #[serde(default)]
     pub exec: bool,
+    /// FTESurf P1668: came from "files_ext" (set by decode, never read from the feed). A journal written by an older
+    /// launcher, or an offline start, may lack it; the next online pass installs it.
+    #[serde(skip)]
+    pub ext: bool,
 }
 
 fn default_platform() -> String {

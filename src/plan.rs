@@ -135,6 +135,7 @@ mod tests {
             component: component.to_string(),
             platform: "all".to_string(),
             exec: false,
+            ext: false,
         }
     }
 

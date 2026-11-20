@@ -43,7 +43,10 @@ pub fn decode(text: &str, public_key: &str, allow_insecure: bool) -> Result<Mani
     let mut m: Manifest = serde_json::from_value(value)?;
     // P1668: "files_ext" holds paths older launchers do not manage; from here on they are ordinary entries and every
     // check below (policy, duplicates, sizes, overlap, totals) covers them.
-    let ext = std::mem::take(&mut m.files_ext);
+    let mut ext = std::mem::take(&mut m.files_ext);
+    for f in &mut ext {
+        f.ext = true;
+    }
     m.files.extend(ext);
     ensure!(
         m.schema == 2 && m.hash_algo == "blake2b-256",
@@ -482,6 +485,9 @@ pub async fn recover(root: &Path, allow_insecure: bool) -> Result<()> {
     let staged_root = checked_path(root, ".ftesurf-updater/download")?;
     let mut moves = Vec::new();
     for f in &jobs {
+        if f.ext && !seen.contains(f.path.as_str()) {
+            continue; // P1668: a journal from a launcher before 0.1.7; the next online pass installs it
+        }
         ensure!(
             seen.contains(f.path.as_str()),
             "journal omits required repair: {}",
@@ -521,7 +527,9 @@ pub async fn recover(root: &Path, allow_insecure: bool) -> Result<()> {
         fs::create_dir_all(dest.parent().unwrap())?;
         fs::rename(src, &dest)?;
     }
-    prepare_install(root, &m).await?;
+    let mut core = m.clone();
+    core.files.retain(|f| !f.ext || seen.contains(f.path.as_str()));
+    prepare_install(root, &core).await?;
     for f in m.files_for_platform() {
         if matches(root, f).await? {
             st.files.insert(f.path.clone(), f.hash.clone());
@@ -531,6 +539,20 @@ pub async fn recover(root: &Path, allow_insecure: bool) -> Result<()> {
     write_meta(root, "state.json", &serde_json::to_vec_pretty(&st)?)?;
     write_meta(root, "installed.json", j.envelope.as_bytes())?;
     fs::remove_file(pending)?;
+    Ok(())
+}
+
+/// P1668: an offline start from a cached feed holding "files_ext" entries this install never received (the cache was
+/// written by an older launcher or by the engine). An absent one is left out; a present one is still verified, so a
+/// stale plugin beside a newer engine refuses as any wrong file does.
+pub fn without_absent_ext(root: &Path, m: &mut Manifest) -> Result<()> {
+    let mut keep = Vec::new();
+    for f in std::mem::take(&mut m.files) {
+        if !f.ext || checked_path(root, &f.path)?.exists() {
+            keep.push(f);
+        }
+    }
+    m.files = keep;
     Ok(())
 }
 
@@ -710,6 +732,27 @@ mod tests {
             assert!(decode(&env, &key, false).is_err(), "{bad}");
         }
         assert!(managed("fteplug_ui_imgui_amd64.so"));
+    }
+    #[test]
+    fn offline_start_leaves_out_only_an_absent_ext_entry() {
+        let so = serde_json::json!({"path": "fteplug_ui_imgui_amd64.so", "hash": "b".repeat(64), "size": 7,
+                                    "platform": "linux64", "exec": false});
+        let (env, key) = signed_feed(serde_json::json!({"files_ext": [so]}));
+        let m = decode(&env, &key, false).unwrap();
+        assert_eq!(m.files.iter().filter(|f| f.ext).count(), 1);
+        assert!(m.files.iter().filter(|f| !f.ext).all(|f| f.path != "fteplug_ui_imgui_amd64.so"));
+        let root = std::env::temp_dir().join(format!("p1668-offline-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut absent = m.clone();
+        without_absent_ext(&root, &mut absent).unwrap();
+        assert!(absent.files.iter().all(|f| !f.ext));
+        assert_eq!(absent.files.len(), m.files.len() - 1);
+        fs::write(root.join("fteplug_ui_imgui_amd64.so"), b"stale").unwrap();
+        let mut present = m.clone();
+        without_absent_ext(&root, &mut present).unwrap();
+        assert_eq!(present.files.len(), m.files.len()); // still verified, so a stale plugin refuses
+        fs::remove_dir_all(&root).unwrap();
     }
     #[test]
     fn signature_is_required() {

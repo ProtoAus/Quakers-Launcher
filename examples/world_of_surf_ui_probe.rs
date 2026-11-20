@@ -40,6 +40,7 @@ async fn main() -> Result<()> {
             component: String::new(),
             platform: "all".into(),
             exec: false,
+            ext: false,
         };
         let result = download::download_all_ftesurf_with_ui(
             reqwest::Client::new(),
